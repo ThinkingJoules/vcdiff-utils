@@ -31,6 +31,7 @@ pub struct RUN{
     pub byte: u8
 }
 
+#[derive(Debug)]
 pub struct Cache {
     near: [usize; Self::S_NEAR], // Fixed array size of 4
     next_slot: usize,
@@ -82,11 +83,10 @@ impl Cache {
         }
 
         // Same cache
-        let same_index = addr % (Self::S_SAME * 256);
-        if self.same[same_index] == addr {
-            let distance = same_index % 256;
-            best_distance = distance;
-            best_mode = self.near.len() + 2 + same_index / 256;
+        let distance = addr % (Self::S_SAME * 256);
+        if self.same[distance] == addr {
+            best_distance = distance % 256;
+            best_mode = Self::S_NEAR + 2 + distance / 256;
         }
         (best_distance as u32, best_mode as u8)
     }
@@ -95,27 +95,33 @@ impl Cache {
     /// It is only advanced by this function, so it remembers what it has read
     /// **here** is the current position in the target output
     /// **mode** is the mode of the address
-    pub fn addr_decode<R:Read>(&mut self, addr_section: &mut R, here: u64, mode: usize) ->  std::io::Result<u64> {
-        let addr ;
+    /// returns (address, bytes_read_from_addr_section)
+    pub fn addr_decode<R:Read>(&mut self, addr_section: &mut R, here: u64, mode: usize) ->  std::io::Result<(u64,usize)> {
+        let addr;
+        let read;
         if mode == 0 { // VCD_SELF
-            let (x,_) = decode_integer(addr_section)?;
+            let (x,a) = decode_integer(addr_section)?;
             addr = x;
+            read = a;
         } else if mode == 1 { // VCD_HERE
-            let (x,_) = decode_integer(addr_section)?;
+            let (x,a) = decode_integer(addr_section)?;
             addr = here - x;
+            read = a;
         } else if mode >= 2 && mode - 2 < Cache::S_NEAR {  // Near cache
                 let near_index = mode - 2;
-                let (x,_) = decode_integer(addr_section)?;
+                let (x,a) = decode_integer(addr_section)?;
                 addr = self.near[near_index] as u64 + x;
+                read = a;
         } else { // Same cache
             let m = mode - (2 + Cache::S_NEAR);
             let mut byte = [0u8];
             addr_section.read_exact(&mut byte)?;
             let same_index = m * 256 + byte[0] as usize;
             addr = self.same[same_index] as u64;
+            read = 1;
         }
         self.update(addr as usize);
-        Ok(addr)
+        Ok((addr,read))
     }
 }
 
@@ -298,6 +304,120 @@ mod test_super {
     fn test_len() -> () {
         assert_eq!(integer_encoded_size(TEST_VALUE), CORRECT_ENCODING.len(), "Length mismatch");
     }
+    use std::io::Cursor;
+    #[test]
+    fn test_vcd_self_mode() {
+        // Test VCD_SELF mode (address encoded by itself)
+        let mut cache = Cache::new();
+        let address = 100;
+        let here = 200;
+
+        // Encode
+        let (encoded_value, mode) = cache.addr_encode(address, here);
+
+        // Expected values based on RFC 3284 section 5.3
+        let expected_value = address;
+        let expected_mode = 0; // VCD_SELF
+
+        assert_eq!(encoded_value, expected_value as u32);
+        assert_eq!(mode, expected_mode);
+
+        // Mock reading the encoded value from address section
+        let mut reader = Cursor::new(vec![100]); // Encoded value 100
+
+        // Decode
+        let (decoded_address, _) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+
+        // Expected decoded address based on the encoding
+        assert_eq!(decoded_address, expected_value as u64);
+    }
+    #[test]
+    fn test_vcd_here_mode() {
+        // Test VCD_HERE mode (address encoded as here - addr)
+        let mut cache = Cache::new();
+        let address = 100;
+        let here = 150;
+
+        // Encode
+        let (encoded_value, mode) = cache.addr_encode(address, here);
+
+        // Expected values based on RFC 3284 section 5.3
+        let expected_value = here - address;
+        let expected_mode = 1; // VCD_HERE
+
+        assert_eq!(encoded_value, expected_value as u32); // Cast to u32 for size comparison
+        assert_eq!(mode, expected_mode);
+
+        // Mock reading the encoded value from address section
+        let mut reader = Cursor::new(vec![50]); // Encoded value 100
+
+        // Decode
+        let (decoded_address,_) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+
+        // Expected decoded address based on the encoding
+        assert_eq!(decoded_address, here as u64 - expected_value as u64);
+    }
+    #[test]
+    fn test_near_cache_mode() {
+        // Test encoding and decoding using the near cache
+        let mut cache = Cache::new();
+        let address = 110;
+        let here = 210;
+
+        // Update near cache to simulate a previously encoded address
+        cache.update(100);
+
+        // Encode
+        let (encoded_value, mode) = cache.addr_encode(address, here);
+
+        // Expected values based on RFC 3284 section 5.3
+        let expected_value = address - 100; // Distance from address to element in near cache
+        let expected_mode = 2; // Near cache mode (offset 2, since fixed size is 4)
+
+        assert_eq!(encoded_value, expected_value as u32);
+        assert_eq!(mode, expected_mode);
+
+        // Mock reading the encoded value from address section
+        let mut reader = Cursor::new(vec![10]); // Encoded value 10
+        // Decode
+        let (decoded_address,_) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+
+        // Expected decoded address based on the encoding
+        assert_eq!(decoded_address, (100 + expected_value) as u64);
+    }
+    #[test]
+    fn test_same_cache_mode() {
+        let mut cache = Cache::new();
+        let base_addr = 5 * 256;  // Example base address
+
+        // Update cache with the base address to populate the same cache
+        cache.update(base_addr);
+
+        // Target address with the same byte value as base_addr,
+        // but at a different offset
+        let target_addr = base_addr; // Offset by a value that's not a multiple of 256
+
+        // Encode
+        let (encoded_value, mode) = cache.addr_encode(target_addr, 2100); // 'here' is irrelevant
+
+        // Expected Values
+        let offset = target_addr % (Cache::S_SAME * 256); // Relative offset
+        let byte_value = target_addr % 256;
+        let expected_mode = Cache::S_NEAR + 2 + offset / 256;
+
+        assert_eq!(encoded_value as usize, byte_value); // Encoded value is the byte itself
+        assert_eq!(mode, expected_mode as u8);
+
+        // Mock reading the encoded value (offset and byte value combined)
+        let mut reader = Cursor::new(vec![(offset % 256) as u8, byte_value as u8]);
+
+        // Decode
+        let (decoded_address, _) = cache.addr_decode(&mut reader, 0, mode as usize).unwrap();
+
+        // Expected decoded address based on the encoding
+        assert_eq!(decoded_address, target_addr as u64);
+    }
+
 }
 use std::io::Read;
 
@@ -466,7 +586,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Copy { size: 16, mode: 8 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 17, mode: 8 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 18, mode: 8 }, second: NoOp },
-    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 0 } },
+    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 0 } }, //163
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 5, mode: 0 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 6, mode: 0 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 1 } },
@@ -476,7 +596,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 5, mode: 2 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 6, mode: 2 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 3 } },
-    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 5, mode: 3 } },
+    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 5, mode: 3 } }, //173
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 6, mode: 3 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 4 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 5, mode: 4 } },
@@ -486,16 +606,16 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 6, mode: 5 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 0 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 0 } },
-    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 0 } },
+    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 0 } }, //183
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 1 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 1 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 1 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 2 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 2 } },
-    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 2 } },
+    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 2 } }, //189
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 3 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 3 } },
-    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 3 } },
+    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 3 } }, //193
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 4 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 4 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 4 } },
@@ -505,7 +625,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 0 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 0 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 0 } },
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 1 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 1 } }, //203
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 1 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 1 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 2 } },
@@ -515,7 +635,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 3 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 3 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 4 } },
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 4 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 4 } }, //213
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 4 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 5 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 5 } },
@@ -525,7 +645,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 0 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 1 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 1 } },
-    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 1 } },
+    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 1 } }, //223
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 2 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 2 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 2 } },

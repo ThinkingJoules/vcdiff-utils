@@ -1,8 +1,9 @@
 use std::io::Write;
 
-use crate::{encode_integer, reader::{DeltaIndicator, WinIndicator}, Cache, CodeTableEntry, TableInst, COPY, RUN, VCD_C_TABLE};
+use crate::{encode_integer, integer_encoded_size, reader::{DeltaIndicator, Header, WinIndicator}, Cache, CodeTableEntry, TableInst, COPY, MAGIC, RUN, VCD_C_TABLE};
 
 
+#[derive(Debug)]
 pub struct VCDEncoder<W:Write> {
     sink:W,
     caches: Cache,
@@ -18,8 +19,15 @@ pub struct VCDEncoder<W:Write> {
 }
 
 impl<W: Write> VCDEncoder<W> {
-    pub fn new(sink: W) -> Self {
-        VCDEncoder {
+    pub fn new(mut sink: W, header:Header) -> std::io::Result<Self> {
+        let Header { hdr_indicator, secondary_compressor_id, code_table_data } = header;
+        if hdr_indicator != 0 || secondary_compressor_id.is_some() || code_table_data.is_some(){
+            unimplemented!("Secondary compressor and code table data are not supported yet.")
+        }
+        sink.write_all(&MAGIC)?;
+        sink.write_all(&[hdr_indicator])?;
+
+        Ok(VCDEncoder {
             sink,
             caches: Cache::new(),
             buffer: [None,None,None],
@@ -29,7 +37,7 @@ impl<W: Write> VCDEncoder<W> {
             addr_buffer: Vec::new(),
             cur_win: None,
             cur_t_size: 0,
-        }
+        })
     }
     fn cur_u_pos(&self) -> u32 {
         self.cur_win.as_ref().unwrap().source_segment_position.unwrap_or(0) as u32 + self.cur_t_size
@@ -72,6 +80,7 @@ impl<W: Write> VCDEncoder<W> {
         let idx = (self.buffer_pos + offset) % 3;
         //if nothing exists at idx we do nothing
         if let Some(inst) = self.buffer[idx].as_ref() {
+            dbg!(inst);
             // 1. Mode Retrieval (For COPY)
             let (f_addr,f_mode) = match &inst {
                 EncInst::COPY(copy) => {
@@ -104,8 +113,9 @@ impl<W: Write> VCDEncoder<W> {
 
                 let table_entry = CodeTableEntry { first, second };
                 match VCD_C_TABLE.iter().skip(163).position(|entry| entry == &table_entry){
-                    Some(double_opcode) => {
-                        self.encode_first_inst(offset, double_opcode as u8, first.size(), Some(f_addr));
+                    Some(from_163) => {
+                        let double_opcode = from_163 as u8 + 163;
+                        self.encode_first_inst(offset, double_opcode, first.size(), Some(f_addr));
                         self.encode_second_to_buffers(offset + 1, second.size());
                     },
                     None => self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),Some(f_addr)),
@@ -164,30 +174,99 @@ impl<W: Write> VCDEncoder<W> {
     }
     pub fn start_new_win(&mut self,win_hdr:WindowHeader)-> std::io::Result<()> {
         self.flush()?;
-        //we use the win_hdr to verify that what they gave us matches what we have.
-        //the size of the target window should be the same as the cur_t_size
-
-
-
-        todo!()
+        self.cur_win = Some(win_hdr);
+        Ok(())
+    }
+    pub fn finish(mut self) -> std::io::Result<W> {
+        self.flush()?;
+        Ok(self.sink)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(wh) = self.cur_win.take() {
-            //first clear our unwritten buffer and write the data to the 3 buffers
-            for i in 0..3 {
-                self.encode_insts(i);
-            }
-            //check that our local data matches the given header
-            //calc the lengths and encode the win hdr
-            //write the 3 arrays
-            //reset the buffer/t_size/etc
-
+        for i in 0..3 {
+            self.encode_insts(i);
         }
+        debug_assert!(self.buffer[0].is_none() && self.buffer[1].is_none() && self.buffer[2].is_none());
+        if let Some(WindowHeader { win_indicator, source_segment_size, source_segment_position, size_of_the_target_window, delta_indicator }) = self.cur_win.take() {
+            //first clear our unwritten buffer and write the data to the 3 buffers
 
+
+            if size_of_the_target_window != self.cur_t_size as u64{
+                //format the error to include the size mismatch
+                let s = format!("Size of the target window does not match the given instructions. Expected {} but instructions sum to {}",size_of_the_target_window,self.cur_t_size);
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, s));
+            }
+            if delta_indicator.to_u8() != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Compression of the target window is not supported. Delta indicator must be 0."));
+            }
+            match win_indicator {
+                WinIndicator::Neither => {
+                    if source_segment_position.is_some() || source_segment_size.is_some() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Source segment size and position must be None for Neither window type."));
+                    }
+                    self.sink.write_all(&[win_indicator.to_u8()])?;
+                },
+                WinIndicator::VCD_SOURCE | WinIndicator::VCD_TARGET => {
+                    if source_segment_position.is_none() || source_segment_size.is_none() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Source segment size and position must be provided for VCD_SOURCE or VCD_TARGET window type."));
+                    }
+                    self.sink.write_all(&[win_indicator.to_u8()])?;
+                    encode_integer(&mut self.sink, source_segment_size.unwrap())?;
+                    encode_integer(&mut self.sink, source_segment_position.unwrap())?;
+                },
+            }
+
+            /*
+            The delta encoding of the target window
+              Length of the delta encoding         - integer
+              The delta encoding
+                  Size of the target window        - integer
+                  Delta_Indicator                  - byte
+                  Length of data for ADDs and RUNs - integer
+                  Length of instructions and sizes - integer
+                  Length of addresses for COPYs    - integer
+                  Data section for ADDs and RUNs   - array of bytes
+                  Instructions and sizes section   - array of bytes
+                  Addresses section for COPYs      - array of bytes
+
+            */
+            //calc the lengths and encode the win hdr
+            let ad_len = self.data_buffer.len();
+            let is_len = self.inst_buffer.len();
+            let a_len = self.addr_buffer.len();
+            //calc the lengths of the integers
+            let ad_int_len = integer_encoded_size(ad_len as u64);
+            let is_int_len = integer_encoded_size(is_len as u64);
+            let a_int_len = integer_encoded_size(a_len as u64);
+            //size of target window int
+            let tw_int_len = integer_encoded_size(size_of_the_target_window);
+            //total length of the delta encoding
+            let total_len = tw_int_len + 1 + ad_int_len + is_int_len + a_int_len + ad_len + is_len + a_len;
+            //write the total length
+            encode_integer(&mut self.sink, total_len as u64)?;
+            //write the size of the target window
+            encode_integer(&mut self.sink, size_of_the_target_window)?;
+            //write the delta indicator
+            self.sink.write_all(&[delta_indicator.to_u8()])?;
+            //write the lengths of the 3 arrays
+            encode_integer(&mut self.sink, ad_len as u64)?;
+            encode_integer(&mut self.sink, is_len as u64)?;
+            encode_integer(&mut self.sink, a_len as u64)?;
+            //write the 3 arrays
+            self.sink.write_all(&self.data_buffer)?;
+            self.sink.write_all(&self.inst_buffer)?;
+            self.sink.write_all(&self.addr_buffer)?;
+            //reset the buffer/t_size/etc
+            self.data_buffer.clear();
+            self.inst_buffer.clear();
+            self.addr_buffer.clear();
+            self.cur_t_size = 0;
+            self.buffer_pos = 0;
+        }
         Ok(())
     }
 }
 
+#[derive(Clone, Debug,PartialEq, Eq)]
 pub enum EncInst{
     ADD(Vec<u8>),
     RUN(RUN),
@@ -247,6 +326,7 @@ impl TableInst{
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WindowHeader {
     pub win_indicator: WinIndicator,
     pub source_segment_size: Option<u64>,
@@ -258,4 +338,119 @@ pub struct WindowHeader {
 fn get_single_inst_opcode(first:TableInst) -> u8 {
     let table_entry = CodeTableEntry { first, second: TableInst::NoOp };
     VCD_C_TABLE.iter().position(|entry| entry == &table_entry).unwrap() as u8
+}
+
+#[cfg(test)]
+mod test_super {
+
+    use super::*;
+    use std::io::Cursor;
+    #[test]
+    fn test_get_single_inst_opcode() {
+        let first = TableInst::Add { size: 1 };
+        let res = get_single_inst_opcode(first);
+        assert_eq!(res,2);
+    }
+    #[test]
+    fn test_get_double_inst_opcode() {
+        let first = TableInst::Add { size: 2 };
+        let second = TableInst::Copy { size: 6, mode: 2 };
+        let table_entry = CodeTableEntry { first, second };
+        let mut res = VCD_C_TABLE.iter().skip(163).position(|entry| entry == &table_entry).unwrap() as u8;
+        res+=163;
+        assert_eq!(res,189);
+    }
+    #[test]
+    fn test_basic_add_run() {
+        // Setup
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+
+        // Create a new window
+        let win_hdr = WindowHeader {
+            win_indicator: WinIndicator::Neither,
+            source_segment_size: None,
+            source_segment_position: None,
+            size_of_the_target_window: 5,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(win_hdr).unwrap();
+
+        // Instructions
+        encoder.next_inst(EncInst::ADD(vec![b'h',b'e'])).unwrap();
+        encoder.next_inst(EncInst::RUN(RUN { len: 2, byte: b'l' })).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'o'])).unwrap();
+
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        let answer = vec![
+            214, 195, 196, 0,  //magic
+            0,  //hdr_indicator
+            0, //win_indicator
+            13, //size_of delta window
+            5, //size of target window
+            0, //delta indicator
+            4, //length of data for ADDs and RUNs
+            4, //length of instructions and sizes
+            0, //length of addresses for COPYs
+            104, 101, 108, 111, //data section b"helo"
+            3, //ADD size 2
+            0, //RUN
+            2, //... of len 2
+            2, //ADD size 1
+        ];
+        assert_eq!(w, answer);
+
+    }
+
+    #[test]
+    fn test_hello_transformation() {
+        // Setup
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+
+        // New window
+        let win_hdr = WindowHeader {
+            win_indicator: WinIndicator::VCD_SOURCE,
+            source_segment_size: Some(4),
+            source_segment_position: Some(1),
+            size_of_the_target_window: 13,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(win_hdr).unwrap();
+
+        // Instructions
+        // "hello" -> "Hello! Hello!"
+        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap(); // Add 'H'
+        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 1 })).unwrap(); // Copy 'ello'
+        encoder.next_inst(EncInst::ADD(vec![b'!', b' '])).unwrap(); // Add '! '
+        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 4  })).unwrap(); // Copy "Hello!"
+
+        // Force encoding (remains the same)
+        let w = encoder.finish().unwrap().into_inner();
+        dbg!(&w);
+        let answer = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            1, //win_indicator VCD_SOURCE
+            4, //SSS
+            1, //SSP
+            12, //delta window size
+            13, //target window size
+            0, //delta indicator
+            3, //length of data for ADDs and RUNs
+            2, //length of instructions and sizes
+            2, //length of addresses for COPYs
+            72,33,32, //'H! ' data section
+            163, //ADD1 COPY4_mode0
+            189, //ADD2 COPY6_mode2
+            1,
+            3,
+        ];
+
+        assert_eq!(w, answer);
+    }
+
 }

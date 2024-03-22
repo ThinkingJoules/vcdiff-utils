@@ -241,9 +241,9 @@ pub enum VCDiffReadMsg {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Header{
-    hdr_indicator: u8,
-    secondary_compressor_id: Option<u8>,
-    code_table_data: Option<CodeTableData>,
+    pub hdr_indicator: u8,
+    pub secondary_compressor_id: Option<u8>,
+    pub code_table_data: Option<CodeTableData>,
 }
 impl Header{
     pub fn encoded_size(&self)->usize{
@@ -273,16 +273,16 @@ pub struct CodeTableData {
 /// Represents a summary of a window in a VCDIFF patch, including the positions of different sections within the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WindowSummary {
-    win_start_pos:u64,
+    pub win_start_pos:u64,
     pub win_indicator: WinIndicator,
     pub source_segment_size: Option<u64>,
     pub source_segment_position: Option<u64>,
-    length_of_the_delta_encoding: u64,
+    pub length_of_the_delta_encoding: u64,
     pub size_of_the_target_window: u64,
     pub delta_indicator: DeltaIndicator,
-    length_of_data_for_adds_and_runs: u64,
-    length_of_instructions_and_sizes: u64,
-    length_of_addresses_for_copys: u64,
+    pub length_of_data_for_adds_and_runs: u64,
+    pub length_of_instructions_and_sizes: u64,
+    pub length_of_addresses_for_copys: u64,
 }
 impl WindowSummary{
     pub fn win_hdr_len(&self)->usize{
