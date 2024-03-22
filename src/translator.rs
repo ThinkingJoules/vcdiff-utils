@@ -1,6 +1,6 @@
 use std::{io::{Read, Seek}, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg, ADD, COPY, RUN}, reader::{read_header, read_window_header, WinIndicator, WindowSummary}};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_header, read_window_header, WinIndicator, WindowSummary}, ADD, COPY, RUN};
 
 
 
@@ -146,19 +146,19 @@ impl<R:Read+Seek> VCDTranslator<R> {
             let c = inst.take_copy();
             self.resolve_copy(c)
         }else{
-            self.store_inst(Inst::RegSrc(inst));
+            self.store_inst(Inst::from_dec(inst));
             1
         }
     }
 
     fn resolve_copy(&mut self, mut copy: COPY) -> usize {
-        let CopyInfo { mut state, seq } = self.determine_copy_type(&copy);
+        let CopyInfo { mut state, seq, copy_addr } = self.determine_copy_type(&copy);
         // handle the sequence first? We would reduce the len of the COPY to the pattern
         // then we would resolve the instructions.
         if let Some(ImplicitSeq { pattern, .. }) = seq {
             copy.len = pattern as u32;
         }
-        let initial = Inst::RegSrc(DecInst::Copy(copy));
+        let initial = Inst::Copy { copy, addr:copy_addr };
         let mut buf = Vec::with_capacity(15);
         buf.push(initial);
 
@@ -220,7 +220,13 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     self.resolve_local(&mut s.inst);
                     output_buffer.push(Inst::Sequence(s));
                 },
-                InstCopy::IsCopy(COPY { len, u_pos }) => {
+                InstCopy::IsCopy { copy:COPY { len, u_pos }, addr } => {
+                    if matches!(&addr, CopyAddr::Source {..}) {
+                        //we are doing a local translation, and it is already in S
+                        //we do nothing.
+                        output_buffer.push(Inst::Copy { copy:COPY { len, u_pos }, addr });
+                        continue;
+                    }
                     //here u_pos should partly be in T of U
                     debug_assert!(u_pos < self.cur_u_pos as u32, "The COPY position is not before our current output position in U");
                     let mut slice = self.get_local_slice(u_pos, len);
@@ -323,7 +329,8 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     self.resolve_global(&mut s.inst);
                     output_buffer.push(Inst::Sequence(s));
                 },
-                InstCopy::IsCopy(COPY { len, u_pos }) => {
+                InstCopy::IsCopy { copy:COPY { len, u_pos }, addr } => {
+                    assert!(matches!(addr, CopyAddr::Unresolved), "The COPY address should always be unresolved in a TrgtSourcedWindow");
                     //here u_pos should already be in S (resolve local should be ran first)
                     //S references our Output stream
                     let mut slice = self.get_global_slice(u_pos, len);
@@ -346,18 +353,23 @@ impl<R:Read+Seek> VCDTranslator<R> {
         let u_end = u_pos + len;
         let t_start = self.cur_t_start().unwrap_or(0) as u32;
         let cur_u = self.cur_u_pos as u32;
-        let is_trgt = self.cur_win().unwrap().is_vcd_target();
+        let ws = self.cur_win().unwrap();
+        let is_trgt = ws.is_vcd_target();
+        let sss = ws.source_segment_size;
+        let ssp = ws.source_segment_position;
         let len = *len as usize;
         if u_end <= t_start { // COPY entirely in S in U
             return CopyInfo {
                 state: if is_trgt { CopyState::TranslateGlobal } else { CopyState::Resolved },
                 seq: None,
+                copy_addr: if is_trgt { CopyAddr::Unresolved  } else { CopyAddr::Source { sss: sss.unwrap(), ssp:ssp.unwrap() } }
             };
         }
         if u_end <= cur_u { // COPY in U that overflows or is entirely in T
             return CopyInfo {
                 state: if is_trgt { CopyState::TranslateLocalThenGlobal } else { CopyState::TranslateLocal },
                 seq: None,
+                copy_addr: CopyAddr::Unresolved
             };
         }
         // Remaining case: u_end > t_start && u_end > cur_u
@@ -365,6 +377,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         CopyInfo {
             state: if is_trgt { CopyState::TranslateLocalThenGlobal } else { CopyState::TranslateLocal },
             seq: Some(ImplicitSeq { pattern, len }),
+            copy_addr: CopyAddr::Unresolved
         }
     }
 
@@ -403,7 +416,8 @@ struct ImplicitSeq{
 }
 struct CopyInfo{
     state:CopyState,
-    seq:Option<ImplicitSeq>
+    seq:Option<ImplicitSeq>,
+    copy_addr:CopyAddr,
 }
 
 /// States:
@@ -442,14 +456,29 @@ pub struct Sequence{pub inst:Vec<Inst>, pub len:u32, pub skip:u32, pub trunc:u32
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inst{
     ///This is a source instruction
-    RegSrc(DecInst),
+    Add(ADD),
+    Run(RUN),
+    Copy{copy:COPY, addr:CopyAddr},
     Sequence(Sequence),
 }
-
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CopyAddr{
+    Unresolved,
+    Source{sss:u64, ssp:u64},
+}
 impl Inst {
+    fn from_dec(inst:DecInst)->Self{
+        match inst {
+            DecInst::Add(a) => Inst::Add(a),
+            DecInst::Copy(c) => Inst::Copy{copy:c, addr:CopyAddr::Unresolved},
+            DecInst::Run(r) => Inst::Run(r),
+        }
+    }
     fn len(&self) -> u32 {
         match self {
-            Inst::RegSrc(inst) => inst.len() as u32,
+            Inst::Add(inst) => {inst.len()},
+            Inst::Run(inst) => {inst.len()},
+            Inst::Copy { copy, .. } => {copy.len()},
             Inst::Sequence(Sequence { len, skip, trunc, ..}) => {
                 //cannot be zero len, we have a logical error somewhere
                 debug_assert!(skip + trunc < *len);
@@ -461,26 +490,31 @@ impl Inst {
     fn skip(&mut self, amt: u32) {
         if amt == 0 {return}
         match self {
-            Inst::RegSrc(inst) => {inst.skip(amt);},
+
             Inst::Sequence(Sequence { skip, .. }) => {*skip += amt as u32;},
+            Inst::Add(inst) => {inst.skip(amt);},
+            Inst::Run(inst) => {inst.skip(amt);},
+            Inst::Copy { copy, .. } => {copy.skip(amt);},
         }
     }
     fn trunc(&mut self, amt: u32){
         if amt == 0 {return}
         match self {
-            Inst::RegSrc(inst) => {inst.trunc(amt);},
+            Inst::Add(inst) => {inst.trunc(amt);},
+            Inst::Run(inst) => {inst.trunc(amt);},
+            Inst::Copy { copy, .. } => {copy.trunc(amt);},
             Inst::Sequence(Sequence {trunc ,..}) => {*trunc += amt as u32;},
         }
     }
     fn has_copy(self)->InstCopy{
         match self{
-            Inst::RegSrc(DecInst::Copy(c)) => {
+            Inst::Copy { copy, addr  } => {
                 //always
-                InstCopy::IsCopy(c)
+                InstCopy::IsCopy { copy, addr }
             },
             Inst::Sequence(Sequence { inst, len, skip, trunc }) => {
                 //sometimes
-                if inst.iter().any(|x|matches!(x,Inst::RegSrc(DecInst::Copy(_)))) {
+                if inst.iter().any(|x|matches!(x,Inst::Copy{..})) {
                     InstCopy::InSequence(Sequence { inst, len, skip, trunc })
                 }else{
                     InstCopy::No(Inst::Sequence(Sequence { inst, len, skip, trunc }))
@@ -493,7 +527,7 @@ impl Inst {
 enum InstCopy{
     No(Inst),
     InSequence(Sequence),
-    IsCopy(COPY)
+    IsCopy{ copy:COPY, addr: CopyAddr  }
 }
 pub struct SparseInst{
     ///The position in the target output stream where this instruction starts outputting bytes
@@ -501,20 +535,55 @@ pub struct SparseInst{
     pub inst: Inst,
 }
 
-impl DecInst{
+impl ADD{
+    fn len(&self)->u32{
+        self.len
+    }
     fn skip(&mut self,amt:u32){
-        match self {
-            DecInst::Add(ADD { len, p_pos }) =>{*len-=amt; *p_pos+=amt as u64;},
-            DecInst::Copy(COPY { len, u_pos }) => {*len-=amt; *u_pos+=amt;},
-            DecInst::Run(RUN{ len, .. }) => {*len-=amt as u32;},
-        }
+        self.len-=amt;
+        self.p_pos+=amt as u64;
     }
     fn trunc(&mut self,amt:u32){
-        match self {
-            DecInst::Add(ADD { len, .. }) |
-            DecInst::Copy(COPY { len, .. }) |
-            DecInst::Run(RUN{ len, .. }) => {*len-=amt;},
-        }
+        self.len-=amt;
     }
 }
+impl RUN{
+    fn len(&self)->u32{
+        self.len
+    }
+    fn skip(&mut self,amt:u32){
+        self.len-=amt as u32;
+    }
+    fn trunc(&mut self,amt:u32){
+        self.len-=amt;
+    }
+}
+impl COPY{
+    fn len(&self)->u32{
+        self.len
+    }
+    fn skip(&mut self,amt:u32){
+        self.len-=amt;
+        self.u_pos+=amt;
+    }
+    fn trunc(&mut self,amt:u32){
+        self.len-=amt;
+    }
+}
+// impl DecInst{
+//     fn skip(&mut self,amt:u32){
+//         match self {
+//             DecInst::Add(ADD { len, p_pos }) =>{*len-=amt; *p_pos+=amt as u64;},
+//             DecInst::Copy(COPY { len, u_pos }) => {*len-=amt; *u_pos+=amt;},
+//             DecInst::Run(RUN{ len, .. }) => {*len-=amt as u32;},
+//         }
+//     }
+//     fn trunc(&mut self,amt:u32){
+//         match self {
+//             DecInst::Add(ADD { len, .. }) |
+//             DecInst::Copy(COPY { len, .. }) |
+//             DecInst::Run(RUN{ len, .. }) => {*len-=amt;},
+//         }
+//     }
+// }
 

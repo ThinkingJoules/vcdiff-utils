@@ -70,7 +70,7 @@ impl<R: Read + Seek> VCDReader<R> {
             let mut buffer = [0; 1];
             self.source.read_exact(&mut buffer)?;
             self.cur_pos += 1;
-            Ok(Some(VCDiffReadMsg::OpCode(buffer[0])))
+            Ok(Some(VCDiffReadMsg::InstSecByte(buffer[0])))
         }else{
             Ok(None)
         }
@@ -232,7 +232,9 @@ pub fn read_window_header<R: Read>(source: &mut R, win_start_pos: u64) -> io::Re
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VCDiffReadMsg {
     WindowSummary(WindowSummary),
-    OpCode(u8),
+    /// A single byte from the Instructions section.
+    /// This might actually be a size of an instruction, but we can't know that without the code table.
+    InstSecByte(u8),
     EndOfWindow,
     EndOfFile,
 }
@@ -440,11 +442,16 @@ mod test_super {
         assert_eq!(msg, VCDiffReadMsg::WindowSummary(TEST_WINDOW));
         //next should be the 3 opcodes
         let msg = vcd_reader.next().unwrap();
-        assert_eq!(msg, VCDiffReadMsg::OpCode(20));
+        assert_eq!(msg, VCDiffReadMsg::InstSecByte(20));
+        //this is technically not an opcode, but a length
+        //however, without the reader knowing the table, it can't know
+        //Our reader only knows this bytes is in the instructions section
+        //So this really isn't an opcode, but we can only return it as if it is
+        //this is fine.
         let msg = vcd_reader.next().unwrap();
-        assert_eq!(msg, VCDiffReadMsg::OpCode(1));
+        assert_eq!(msg, VCDiffReadMsg::InstSecByte(1));
         let msg = vcd_reader.next().unwrap();
-        assert_eq!(msg, VCDiffReadMsg::OpCode(24));
+        assert_eq!(msg, VCDiffReadMsg::InstSecByte(24));
         //next should be EoW
         let msg = vcd_reader.next().unwrap();
         assert_eq!(msg, VCDiffReadMsg::EndOfWindow);

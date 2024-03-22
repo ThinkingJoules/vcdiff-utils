@@ -9,6 +9,115 @@ pub mod applicator;
 //The patch file itself can be larger, but we can't have a window that large.
 pub const MAGIC:[u8;4] = [b'V'|0x80, b'C'|0x80, b'D'|0x80, 0];
 
+///Decoded ADD instruction
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ADD{
+    ///Length of the data in the data section
+    pub len:u32,
+    ///Absolute position in the Patch file where the data starts (in the data section for this window)
+    pub p_pos:u64,
+}
+///Decoded COPY instruction
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct COPY{
+    pub len:u32,
+    ///Decoded start position in window string U
+    pub u_pos:u32,
+}
+///Inlined of Decoded RUN instruction
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RUN{
+    pub len: u32,
+    pub byte: u8
+}
+
+pub struct Cache {
+    near: [usize; Self::S_NEAR], // Fixed array size of 4
+    next_slot: usize,
+    same: [usize; Self::S_SAME * 256], // Fixed array size of 3 * 256
+}
+
+impl Cache {
+    const S_NEAR: usize = 4;
+    const S_SAME: usize = 3;
+    pub fn new() -> Self {
+        Cache {
+            near: [0; Self::S_NEAR],
+            next_slot: 0,
+            same: [0; Self::S_SAME * 256],
+        }
+    }
+    fn update(&mut self, address: usize) {
+        // Update near cache
+        self.near[self.next_slot] = address;
+        self.next_slot = (self.next_slot + 1) % Self::S_NEAR; // Modulus for circular buffer within array
+
+        // Update same cache
+        let same_index = address % (Self::S_SAME * 256); // Modulus for same cache addressing
+        self.same[same_index] = address;
+    }
+
+    pub fn addr_encode(&mut self, addr: usize, here: usize) -> (u32, u8) { // Return encoded address and mode
+        let res = self.peek_addr_encode(addr, here);
+        self.update(addr);
+        res
+    }
+    pub fn peek_addr_encode(&self, addr: usize, here: usize) -> (u32, u8){
+        let mut best_distance = addr;
+        let mut best_mode = 0; // VCD_SELF
+
+        // VCD_HERE
+        let distance = here - addr;
+        if distance < best_distance {
+            best_distance = distance;
+            best_mode = 1;
+        }
+
+        // Near cache
+        for (i, &near_addr) in self.near.iter().enumerate() {
+            if addr >= near_addr && addr - near_addr < best_distance {
+                best_distance = addr - near_addr;
+                best_mode = i + 2;
+            }
+        }
+
+        // Same cache
+        let same_index = addr % (Self::S_SAME * 256);
+        if self.same[same_index] == addr {
+            let distance = same_index % 256;
+            best_distance = distance;
+            best_mode = self.near.len() + 2 + same_index / 256;
+        }
+        (best_distance as u32, best_mode as u8)
+    }
+
+    /// **addr_section**, is a reader that is positioned at the start of the address section
+    /// It is only advanced by this function, so it remembers what it has read
+    /// **here** is the current position in the target output
+    /// **mode** is the mode of the address
+    pub fn addr_decode<R:Read>(&mut self, addr_section: &mut R, here: u64, mode: usize) ->  std::io::Result<u64> {
+        let addr ;
+        if mode == 0 { // VCD_SELF
+            let (x,_) = decode_integer(addr_section)?;
+            addr = x;
+        } else if mode == 1 { // VCD_HERE
+            let (x,_) = decode_integer(addr_section)?;
+            addr = here - x;
+        } else if mode >= 2 && mode - 2 < Cache::S_NEAR {  // Near cache
+                let near_index = mode - 2;
+                let (x,_) = decode_integer(addr_section)?;
+                addr = self.near[near_index] as u64 + x;
+        } else { // Same cache
+            let m = mode - (2 + Cache::S_NEAR);
+            let mut byte = [0u8];
+            addr_section.read_exact(&mut byte)?;
+            let same_index = m * 256 + byte[0] as usize;
+            addr = self.same[same_index] as u64;
+        }
+        self.update(addr as usize);
+        Ok(addr)
+    }
+}
 
 // Define the Instruction enum with associated data for size and mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -190,6 +299,8 @@ mod test_super {
         assert_eq!(integer_encoded_size(TEST_VALUE), CORRECT_ENCODING.len(), "Length mismatch");
     }
 }
+use std::io::Read;
+
 use TableInst::*;
 pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Run , second: NoOp },
