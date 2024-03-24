@@ -113,7 +113,7 @@ impl<W: Write> VCDEncoder<W> {
                 // 2. TableInst Creation
                 let second = TableInst::from_enc_inst_sec(Some(next),s_mode);
 
-                let table_entry = CodeTableEntry { first, second };
+                let table_entry = get_proper_table_entry(first,Some(second));
                 let start_offset = if table_entry.sec_is_noop() {0}else{163};
                 //this should always find a code in the standard table
                 let code_pos = VCD_C_TABLE.iter().skip(start_offset).position(|entry| entry == &table_entry).unwrap();
@@ -405,7 +405,15 @@ pub struct WindowHeader {
     pub size_of_the_target_window: u64,
     pub delta_indicator: DeltaIndicator,
 }
-
+fn get_proper_table_entry(first:TableInst,second:Option<TableInst>) -> CodeTableEntry{
+    //we need to filter additionally for the odd ball double ops
+    match (first,second) {
+        (TableInst::Copy { size:copy_size, .. },Some(TableInst::Add { size:add_size })) if add_size == 1 && copy_size == 4 => CodeTableEntry { first, second:second.unwrap() },
+        (TableInst::Add { size:add_size },Some(TableInst::Copy { .. })) if (1..=4).contains(&add_size) => CodeTableEntry { first, second:second.unwrap()  },
+        (first,Some(_)) |
+        (first,None) => CodeTableEntry { first, second: TableInst::NoOp },
+    }
+}
 fn get_single_inst_opcode(first:TableInst) -> u8 {
     let table_entry = CodeTableEntry { first, second: TableInst::NoOp };
     VCD_C_TABLE.iter().position(|entry| entry == &table_entry).unwrap() as u8
@@ -682,4 +690,121 @@ mod test_super {
 
     }
 
+    #[test]
+    pub fn kitchen_sink_transform(){
+        //we need 3 windows, Neither, Src, and Target, in that order.
+        //src will be 'hello' and output will be 'Hello! Hello! Hell...'
+        //we encode just the Add(H) in the Neither window
+        //then we encode the COPY(ello) in the Src window
+        //then we encode the Copy(Hello!) in the Target window
+        //then we encode the Copy(Hell) in the Target window, referencing the last window
+        //then we encode the Add('.') in the Target window
+        //then we encode an implicit Copy For the last '..' chars.
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let n_window = WindowHeader {
+            win_indicator: WinIndicator::Neither,
+            source_segment_size: None,
+            source_segment_position: None,
+            size_of_the_target_window: 1,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(n_window).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
+        let s_window = WindowHeader {
+            win_indicator: WinIndicator::VCD_SOURCE,
+            source_segment_size: Some(4),
+            source_segment_position: Some(1),
+            size_of_the_target_window: 5,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(s_window).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'!'])).unwrap();
+        let t_window = WindowHeader {
+            win_indicator: WinIndicator::VCD_TARGET,
+            source_segment_size: Some(6),
+            source_segment_position: Some(0),
+            size_of_the_target_window: 7,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(t_window).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b' '])).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 0 })).unwrap();
+        let t_window = WindowHeader {
+            win_indicator: WinIndicator::VCD_TARGET,
+            source_segment_size: Some(5),
+            source_segment_position: Some(6),
+            size_of_the_target_window: 8,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(t_window).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 5, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'.'])).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 3, u_pos: 10 })).unwrap();
+
+
+        let w = encoder.finish().unwrap().into_inner();
+        //dbg!(&w);
+        let answer = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            0, //win_indicator Neither
+            7, //delta window size
+            1, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            0, //length of addr
+            72, //data section 'H
+            2, //ADD1
+            1, //win_indicator VCD_SOURCE
+            4, //SSS
+            1, //SSP
+            8, //delta window size
+            5, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            1, //length of addr
+            33, //data section '!'
+            253, //COPY4_mode5 ADD1
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            6, //SSS
+            0, //SSP
+            9, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            2, //length of instructions and size
+            1, //length of addr
+            32, //data section ' '
+            2, //ADD1 NOOP
+            118, //COPY6_mode6 NOOP
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            5, //SSS
+            6, //SSP
+            12, //delta window size
+            8, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            4, //length of instructions and size
+            2, //length of addr
+            46, //data section '.'
+            117, //ADD1 COPY5_mode6
+            2, //Add1 NOOP
+            35, //COPY0_mode1
+            3, //...size
+            0, //addr 0
+            1, //addr 1
+        ];
+
+        assert_eq!(w, answer);
+
+
+
+    }
 }

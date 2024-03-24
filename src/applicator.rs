@@ -54,57 +54,55 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(mut patch:R,mut src:Option<R>,mut 
                 for inst in [Some(first),second]{
                     if inst.is_none() {break;}
                     let inst = inst.unwrap();
-                    let len = inst.len_in_u();
+                    let len_in_t = inst.len_in_t(cur_u.len());
                     match inst {
                         DecInst::Add(ADD{ p_pos,.. }) => {
                             let patch_r = decoder.reader().get_reader(p_pos)?;
-                            let mut slice = vec![0u8;len];
+                            let mut slice = vec![0u8;len_in_t];
                             patch_r.read_exact(&mut slice)?;
                             cur_u.append(&mut slice);
                         },
-                        DecInst::Copy(COPY{  u_pos, .. }) => {
+                        DecInst::Copy(COPY{  u_pos, len:copy_in_u }) => {
                             let u_pos = u_pos as usize;
                             //first figure out if this is an implicit sequence
                             let cur_end = cur_u.len();
-                            let copy_end = u_pos + len;
+                            let copy_end = u_pos + copy_in_u as usize;
                             unsafe{
                                 // Get raw pointers
                                 let cur_u_ptr = cur_u.as_mut_ptr();
                                 let slice_ptr = cur_u.as_ptr();
                                 // Extend 'cur_u' with uninitialized memory, making it long enough
-                                cur_u.set_len(cur_u.len() + len);
+                                cur_u.set_len(cur_u.len() + len_in_t);
 
                                 // Copy data in a loop
                                 let mut amt_copied = 0;
-                                while amt_copied < len {
+                                while amt_copied < len_in_t {
                                     let (copy_len,source_offset) = if copy_end > cur_end {
                                         let seq_len = cur_end-u_pos;
-                                        let copy_len = std::cmp::min(len - amt_copied, seq_len);
+                                        let copy_len = std::cmp::min(len_in_t - amt_copied, seq_len);
                                         let seq_offset = amt_copied % seq_len;
-                                        (copy_len,seq_offset)
+                                        (copy_len,seq_offset+u_pos)
                                     } else{//regular copy
                                         //this should run the loop a single time
-                                        (len as usize, u_pos as usize)
+                                        (copy_in_u as usize, u_pos as usize)
                                     };
                                     // Calculate offsets for copying
                                     let dest_offset = cur_end + amt_copied;
-
                                     // Use ptr::copy_nonoverlapping for the memory copy
                                     std::ptr::copy_nonoverlapping(
                                         slice_ptr.add(source_offset),
                                         cur_u_ptr.add(dest_offset),
                                         copy_len
                                     );
-
                                     amt_copied += copy_len;
                                 }
                             }
                         },
                         DecInst::Run(RUN{  byte, .. }) => {
-                            cur_u.extend(std::iter::repeat(byte).take(len));
+                            cur_u.extend(std::iter::repeat(byte).take(len_in_t));
                         },
                     }
-                    t_pos += len;
+                    t_pos += len_in_t;
                 }
             },
             VCDiffDecodeMsg::EndOfWindow => {
@@ -289,20 +287,24 @@ impl SparseCache
             Bound::Excluded(&e) => e,
             Bound::Unbounded => self.buffer.len() as u64, // Assume the range extends to the end
         };
+        let range = start..end;
         let mut slice_start = None;
         let mut last_end = 0;
         for Segment { src_start, buf_start, len } in &self.segment_map {
             let len = *len as u64;
-            if slice_start.is_some() {
-                if last_end != *src_start {
-                    panic!("Non-contiguous segments in the cache");
+            if let Some(in_range) = range_overlap(&(*src_start..*src_start + len), &range) {
+                let slice_end = src_start + len;
+                if slice_start.is_some() {
+                    if last_end != *src_start {
+                        panic!("Non-contiguous segments in the cache");
+                    }
+                }else if in_range.start <= start{
+                    slice_start = Some(*buf_start + (start - src_start) as usize);
                 }
-            }else if *src_start <= start && start < *src_start + len{
-                slice_start = Some(*buf_start + (start - *src_start) as usize);
-            }
-            if *src_start <= end && end <= *src_start + len {
-                let slice_end = *buf_start + (end - *src_start) as usize;
-                return &self.buffer[slice_start.unwrap()..slice_end];
+                if end <= slice_end {
+                    let slice_end = *buf_start + len as usize - (slice_end - end) as usize;
+                    return &self.buffer[slice_start.unwrap()..slice_end];
+                }
             }
             last_end = *src_start + len;
         }
@@ -405,6 +407,72 @@ mod tests {
         assert_eq!(sink, "Hello! Hello!".as_bytes());
     }
 
+    #[test]
+    fn test_kitchen_sink(){
+        // "hello" -> "Hello! Hello! Hell..."
+        let src = Cursor::new("hello".as_bytes().to_vec());
+
+        //from encoder tests
+        let patch = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            0, //win_indicator Neither
+            7, //delta window size
+            1, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            0, //length of addr
+            72, //data section 'H
+            2, //ADD1
+            1, //win_indicator VCD_SOURCE
+            4, //SSS
+            1, //SSP
+            8, //delta window size
+            5, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            1, //length of addr
+            33, //data section '!'
+            253, //COPY4_mode5 ADD1
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            6, //SSS
+            0, //SSP
+            9, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            2, //length of instructions and size
+            1, //length of addr
+            32, //data section ' '
+            2, //ADD1 NOOP
+            118, //COPY6_mode6 NOOP
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            5, //SSS
+            6, //SSP
+            12, //delta window size
+            8, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            4, //length of instructions and size
+            2, //length of addr
+            46, //data section '.'
+            117, //ADD1 COPY5_mode6
+            2, //Add1 NOOP
+            35, //COPY0_mode1
+            3, //...size
+            0, //addr 0
+            1, //addr 1
+        ];
+        let patch = Cursor::new(patch);
+        let mut sink = Vec::new();
+        apply_patch(patch,Some(src),&mut sink).unwrap();
+        assert_eq!(sink, "Hello! Hello! Hell...".as_bytes());
+
+    }
 
     #[test]
     fn test_add_and_retrieve() {
