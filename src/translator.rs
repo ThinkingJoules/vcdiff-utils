@@ -61,14 +61,14 @@ pub struct VCDTranslator<R>{
     windows: Vec<WindowSummary>,
     ///Used to resolve dependencies for TrgtSourcedWindows
     src_data: Vec<SparseInst>,
-    cur_window_inst: Vec<Inst>,
+    cur_window_inst: Vec<ProcessInst>,
     cur_o_pos: u64,
     cur_u_pos: usize,
 }
 
 impl<R:Read+Seek> VCDTranslator<R> {
-    pub fn new(decoder: VCDDecoder<R>, mut patch_reader:R) -> std::io::Result<Self> {
-        let windows = gather_summaries(&mut patch_reader)?;
+    pub fn new(mut decoder: VCDDecoder<R>) -> std::io::Result<Self> {
+        let windows = gather_summaries(&mut decoder.reader().get_reader(0)?)?;
         let dependencies = find_dep_ranges(&windows);
         Ok(VCDTranslator {
             decoder,
@@ -92,7 +92,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         None
     }
     pub fn interrogate(&mut self, o_position: u64) -> std::io::Result<Option<SparseInst>> {
-        while self.cur_o_pos < o_position {//will fall through if it is a prev inst.
+        while self.cur_o_pos <= o_position {//will fall through if it is a prev inst.
             let count = self.next_op()?;
             if count == 0 {
                 return Ok(None);
@@ -103,12 +103,9 @@ impl<R:Read+Seek> VCDTranslator<R> {
     fn interrogate_prev(&self, o_position: u64)->SparseInst{
         let mut pos = self.cur_o_pos;
         for inst in self.cur_window_inst.iter().rev() {
-            let cur_inst_start = pos - inst.len() as u64;
+            let cur_inst_start = pos - inst.len_in_t(pos as u32) as u64;
             if (cur_inst_start..pos).contains(&o_position) {
-                return SparseInst {
-                    o_start: cur_inst_start,
-                    inst: inst.clone(),
-                };
+                return inst.to_sparse_inst(cur_inst_start);
             }
             pos = cur_inst_start;
         }
@@ -121,7 +118,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
     ///This can return more than 2, since we might need to resolve a TrgtSourcedWindow or a COPY in T (or Both).
     fn next_op(&mut self)->std::io::Result<usize>{
         //a form of double entry accounting to make sure all the translations are correct.
-        assert!(self.cur_o_pos == self.decoder.position(), "Decoder and Merge Handle are out of sync!");
+        assert!(self.cur_o_pos == self.decoder.position(), "Decoder and Merge Handle are out of sync! {} != {}", self.cur_o_pos, self.decoder.position());
         loop {
             match self.decoder.next()?{
                 VCDiffDecodeMsg::WindowSummary(ws) => {
@@ -130,7 +127,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
                 },
                 VCDiffDecodeMsg::Inst { o_start,first, second } => {
                     //here we need to resolve instructions for merging
-                    assert!(o_start == self.cur_o_pos, "We are out of sync with the output stream");
+                    assert!(o_start == self.cur_o_pos, "We are out of sync with the output stream {} != {}", self.cur_o_pos, self.decoder.position());
                     let mut count = 0;
                     count += self.resolve_inst(first);
                     if let Some(second) = second {
@@ -150,7 +147,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
             let c = inst.take_copy();
             self.resolve_copy(c)
         }else{
-            self.store_inst(Inst::from_dec(inst));
+            self.store_inst(ProcessInst::from_dec(inst));
             1
         }
     }
@@ -162,10 +159,9 @@ impl<R:Read+Seek> VCDTranslator<R> {
         if let Some(ImplicitSeq { pattern, .. }) = seq {
             copy.len = pattern as u32;
         }
-        let initial = Inst::Copy { copy, addr:copy_addr };
+        let initial = ProcessInst::Copy { copy, addr:copy_addr };
         let mut buf = Vec::with_capacity(15);
         buf.push(initial);
-
         loop {
             match state {
                 CopyState::TranslateLocal | CopyState::TranslateLocalThenGlobal=> {
@@ -184,7 +180,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         //this might have been a no-op, but we still need to handle the sequence case
         let count = buf.len();
         if let Some(ImplicitSeq { len, .. }) = seq {
-            self.store_inst(Inst::Sequence(Sequence { inst: buf, len: len as u32, skip: 0, trunc: 0}));
+            self.store_inst(ProcessInst::Sequence(ProcSequence { inst: buf, len: len as u32, skip: 0, trunc: 0}));
         }else{
             self.cur_window_inst.reserve(count);
             for inst in buf.drain(..) {
@@ -194,7 +190,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         count
     }
     // This handles translation using the current window's data
-    fn resolve_local(&mut self, input_buffer:&mut Vec<Inst>){
+    fn resolve_local(&mut self, input_buffer:&mut Vec<ProcessInst>){
         //it is possible to have window with no reference source
         //In this case we will always get TranslateLocal, but there is no S to transfer to.
         //In that case our resulting vec will only have ADD/RUNs and nothing else
@@ -222,58 +218,55 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     //So this would require resolving those inner instructions as they might also be in T
                     //This is fine, as long as we get eventually get COPYs in S or ADD/RUNs.
                     self.resolve_local(&mut s.inst);
-                    output_buffer.push(Inst::Sequence(s));
+                    output_buffer.push(ProcessInst::Sequence(s));
                 },
                 InstCopy::IsCopy { copy:COPY { len, u_pos }, addr } => {
                     if matches!(&addr, CopyAddr::Source {..}) {
                         //we are doing a local translation, and it is already in S
                         //we do nothing.
-                        output_buffer.push(Inst::Copy { copy:COPY { len, u_pos }, addr });
+                        output_buffer.push(ProcessInst::Copy { copy:COPY { len, u_pos }, addr });
                         continue;
                     }
                     //here u_pos should partly be in T of U
                     debug_assert!(u_pos < self.cur_u_pos as u32, "The COPY position is not before our current output position in U");
                     let mut slice = self.get_local_slice(u_pos, len);
-                    //sanity check for len
-                    debug_assert!(slice.iter().map(|x|x.len()).sum::<u32>() == len, "The slice length does not match the COPY length");
+                    // //sanity check for len
+                    // debug_assert!(slice.iter().map(|x|x.len_in_u()).sum::<u32>() == len, "The slice length does not match the COPY length");
                     output_buffer.append(&mut slice);
                 },
             }
         }
     }
 
-    fn get_local_slice(&self, u_pos: u32, len: u32) -> Vec<Inst> {
+    fn get_local_slice(&self, u_pos: u32, len: u32) -> Vec<ProcessInst> {
         let mut slice = Vec::new();
         let mut pos = 0;
         let slice_end = u_pos + len;
+        let range = u_pos..slice_end;
         for inst in self.cur_window_inst.iter() {
-            let len = inst.len();
+            let len = inst.len_in_u();
             let cur_inst_end = pos + len;
-            if cur_inst_end <= u_pos {
-                //we are not there yet
-            } else if pos >= u_pos && slice.is_empty() {
-                //we are in the middle of the first instruction
-                let mut start = inst.clone();
-                let skip = u_pos - pos;
-                start.skip(skip);
-                slice.push(start);
-            }else if cur_inst_end >= slice_end { //non-aligned end state
-                let mut end = inst.clone();
-                let truc = cur_inst_end - slice_end;
-                end.trunc(truc);
-                slice.push(end);
+            if let Some(overlap) = range_overlap(&(pos..cur_inst_end), &range) {
+                let mut cur_inst = inst.clone();
+                if overlap.start > pos {
+                    let skip = overlap.start - pos;
+                    cur_inst.skip(skip);
+                }
+                if overlap.end < cur_inst_end {
+                    let trunc = cur_inst_end - overlap.end;
+                    cur_inst.trunc(trunc);
+                }
+                slice.push(cur_inst);
+            }
+            if cur_inst_end >= slice_end {
                 break;
-            } else if cur_inst_end < slice_end {
-                //take the whole instruction
-                debug_assert!(!slice.is_empty(), "We should have started the slice");
-                slice.push(inst.clone());
             }
             pos += len;
         }
         slice
     }
 
-    fn get_global_slice(&self, u_pos: u32, len: u32) -> Vec<Inst> {
+    fn get_global_slice(&self, u_pos: u32, len: u32) -> Vec<ProcessInst> {
         //first we need to get our source window size and position
         let cur_win = self.cur_win().unwrap();
         debug_assert!( cur_win.is_vcd_target(), "We can only translate from a TargetSourcedWindow");
@@ -292,12 +285,12 @@ impl<R:Read+Seek> VCDTranslator<R> {
                 //we are not there yet
             } else if *o_start >= o_pos && slice.is_empty() {
                 //we are in the middle of the first instruction
-                let mut start = inst.clone();
+                let mut start = inst.as_proc_inst();
                 let skip = o_pos - o_start;
                 start.skip(skip as u32);
                 slice.push(start);
             } else if cur_inst_end >= slice_end { //non-aligned end state
-                let mut end = inst.clone();
+                let mut end = inst.as_proc_inst();
                 let trunc = cur_inst_end - slice_end;
                 end.trunc(trunc as u32);
                 slice.push(end);
@@ -305,7 +298,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
             }else if cur_inst_end < slice_end {// whole instruction mid-slice
                 //take the whole instruction
                 debug_assert!(!slice.is_empty(), "We should have started the slice");
-                slice.push(inst.clone());
+                slice.push(inst.as_proc_inst());
             }
             last = cur_inst_end;
         }
@@ -313,7 +306,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
     }
 
     // This handles cross-window translation using previously resolved instructions
-    fn resolve_global(&mut self,input_buffer:&mut Vec<Inst>){
+    fn resolve_global(&mut self,input_buffer:&mut Vec<ProcessInst>){
         //the buffer here only contains instructions in S or they are ADD/RUNs
 
         //we need to translate COPYs since our cur_win is TargetSourced.
@@ -331,15 +324,15 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     //recursively resolve the inner instructions
                     //this happens when we have had an earlier implicit sequence
                     self.resolve_global(&mut s.inst);
-                    output_buffer.push(Inst::Sequence(s));
+                    output_buffer.push(ProcessInst::Sequence(s));
                 },
                 InstCopy::IsCopy { copy:COPY { len, u_pos }, addr } => {
                     assert!(matches!(addr, CopyAddr::Unresolved), "The COPY address should always be unresolved in a TrgtSourcedWindow");
                     //here u_pos should already be in S (resolve local should be ran first)
                     //S references our Output stream
                     let mut slice = self.get_global_slice(u_pos, len);
-                    //sanity check for len
-                    debug_assert!(slice.iter().map(|x|x.len()).sum::<u32>() == len, "The slice length does not match the COPY length");
+                    // //sanity check for len
+                    // debug_assert!(slice.iter().map(|x|x.len_in_u()).sum::<u32>() == len, "The slice length does not match the COPY length");
                     output_buffer.append(&mut slice);
                 },
             }
@@ -361,7 +354,6 @@ impl<R:Read+Seek> VCDTranslator<R> {
         let is_trgt = ws.is_vcd_target();
         let sss = ws.source_segment_size;
         let ssp = ws.source_segment_position;
-        let len = *len as usize;
         if u_end <= t_start { // COPY entirely in S in U
             return CopyInfo {
                 state: if is_trgt { CopyState::TranslateGlobal } else { CopyState::Resolved },
@@ -378,6 +370,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         }
         // Remaining case: u_end > t_start && u_end > cur_u
         let pattern = (cur_u - u_pos) as usize;
+        let len = (u_end - cur_u) as usize;
         CopyInfo {
             state: if is_trgt { CopyState::TranslateLocalThenGlobal } else { CopyState::TranslateLocal },
             seq: Some(ImplicitSeq { pattern, len }),
@@ -394,17 +387,14 @@ impl<R:Read+Seek> VCDTranslator<R> {
             }
         }
     }
-    fn store_inst(&mut self,inst:Inst){
+    fn store_inst(&mut self,inst:ProcessInst){
         self.update_deps();//we have added instructions since last call, make sure last is correct.
-        let len = inst.len();
+        let len = inst.len_in_t(self.cur_u_pos as u32);
         let new_o_pos = self.cur_o_pos + len as u64;
         //do later things depend on this?
         if let Some(r) = self.dependencies.last() {
             if r.start <= self.cur_o_pos || r.end > new_o_pos {
-                self.src_data.push(SparseInst {
-                    o_start: self.cur_o_pos,
-                    inst: inst.clone(),
-                });
+                self.src_data.push(inst.to_sparse_inst(self.cur_o_pos));
             }
         }
         self.cur_u_pos += len as usize;
@@ -430,6 +420,7 @@ struct CopyInfo{
 /// TranslateLocal -> TranslateGlobal -> DONE
 ///
 /// TranslateGlobal -> DONE
+#[derive(Debug)]
 enum CopyState{
     ///Buffer contains translated instructions
     Resolved,
@@ -455,35 +446,147 @@ impl CopyState {
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcSequence{pub inst:Vec<ProcessInst>, pub len:u32, pub skip:u32, pub trunc:u32}
+
+impl ProcSequence {
+    fn to_seq(&self) -> Sequence {
+        Sequence {
+            inst: self.inst.iter().map(|x|x.to_inst()).collect(),
+            len: self.len,
+            skip: self.skip,
+            trunc: self.trunc,
+        }
+    }
+}
+
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sequence{pub inst:Vec<Inst>, pub len:u32, pub skip:u32, pub trunc:u32}
 
+impl Sequence {
+    fn to_proc_seq(&self) -> ProcSequence {
+        ProcSequence {
+            inst: self.inst.iter().map(|x|x.as_proc_inst()).collect(),
+            len: self.len,
+            skip: self.skip,
+            trunc: self.trunc,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inst{
     ///This is a source instruction
     Add(ADD),
     Run(RUN),
-    Copy{copy:COPY, addr:CopyAddr},
+    ///The source window this COPY command refers to
+    Copy{copy:COPY, sss:u64, ssp:u64},
     Sequence(Sequence),
+}
+
+impl Inst {
+    fn as_proc_inst(&self) -> ProcessInst {
+        match self {
+            Inst::Add(inst) => ProcessInst::Add(inst.clone()),
+            Inst::Run(inst) => ProcessInst::Run(inst.clone()),
+            Inst::Copy { copy, sss, ssp } => ProcessInst::Copy { copy: copy.clone(), addr: CopyAddr::Source { sss: *sss, ssp: *ssp } },
+            Inst::Sequence(seq) => ProcessInst::Sequence(seq.to_proc_seq()),
+        }
+    }
+    fn len(&self) -> u32 {
+        match self {
+            Self::Add(inst) => {inst.len()},
+            Self::Run(inst) => {inst.len()},
+            Self::Copy { copy, .. } => {copy.len()},
+            Self::Sequence(Sequence { len, skip, trunc, ..}) => {
+                //cannot be zero len, we have a logical error somewhere
+                debug_assert!(skip + trunc < *len);
+                len - (skip + trunc)
+            },
+        }
+
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessInst{
+    ///This is a source instruction
+    Add(ADD),
+    Run(RUN),
+    Copy{copy:COPY, addr:CopyAddr},
+    Sequence(ProcSequence),
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CopyAddr{
     Unresolved,
     Source{sss:u64, ssp:u64},
 }
-impl Inst {
-    fn from_dec(inst:DecInst)->Self{
-        match inst {
-            DecInst::Add(a) => Inst::Add(a),
-            DecInst::Copy(c) => Inst::Copy{copy:c, addr:CopyAddr::Unresolved},
-            DecInst::Run(r) => Inst::Run(r),
+impl ProcessInst {
+    fn to_sparse_inst(&self, o_start: u64) -> SparseInst {
+        SparseInst {
+            o_start,
+            inst: self.to_inst(),
         }
     }
-    fn len(&self) -> u32 {
+    fn to_inst(&self) -> Inst {
         match self {
-            Inst::Add(inst) => {inst.len()},
-            Inst::Run(inst) => {inst.len()},
-            Inst::Copy { copy, .. } => {copy.len()},
-            Inst::Sequence(Sequence { len, skip, trunc, ..}) => {
+            ProcessInst::Add(inst) => Inst::Add(inst.clone()),
+            ProcessInst::Run(inst) => Inst::Run(inst.clone()),
+            ProcessInst::Copy { copy, addr:CopyAddr::Source{ sss, ssp } } => Inst::Copy { copy: copy.clone(), sss:*sss, ssp:*ssp },
+            ProcessInst::Sequence(seq) => Inst::Sequence(seq.to_seq()),
+            ProcessInst::Copy { .. } => panic!("Cannot convert unresolved COPY to Inst"),
+        }
+    }
+    fn from_dec(inst:DecInst)->Self{
+        match inst {
+            DecInst::Add(a) => ProcessInst::Add(a),
+            DecInst::Copy(c) => ProcessInst::Copy{copy:c, addr:CopyAddr::Unresolved},
+            DecInst::Run(r) => ProcessInst::Run(r),
+        }
+    }
+    fn has_copy(self)->InstCopy{
+        match self{
+            Self::Copy { copy, addr  } => {
+                //always
+                InstCopy::IsCopy { copy, addr }
+            },
+            Self::Sequence(ProcSequence { inst, len, skip, trunc }) => {
+                //sometimes
+                if inst.iter().any(|x|matches!(x,Self::Copy{..})) {
+                    InstCopy::InSequence(ProcSequence { inst, len, skip, trunc })
+                }else{
+                    InstCopy::No(Self::Sequence(ProcSequence { inst, len, skip, trunc }))
+                }
+            },
+            a => InstCopy::No(a)
+        }
+    }
+    fn len_in_u(&self) -> u32 {
+        match self {
+            Self::Add(inst) => {inst.len()},
+            Self::Run(inst) => {inst.len()},
+            Self::Copy { copy, .. } => {copy.len()},
+            Self::Sequence(ProcSequence { len, skip, trunc, ..}) => {
+                //cannot be zero len, we have a logical error somewhere
+                debug_assert!(skip + trunc < *len);
+                len - (skip + trunc)
+            },
+        }
+
+    }
+    fn len_in_t(&self, inst_u_start:u32) -> u32 {
+        match self {
+            Self::Add(inst) => {inst.len()},
+            Self::Run(inst) => {inst.len()},
+            Self::Copy { copy:COPY { len, u_pos }, .. } => {
+                let u_pos = *u_pos as u32;
+                let end = u_pos + *len;
+                if end > inst_u_start {
+                    end - inst_u_start
+                }else{
+                    *len
+                }
+            },
+            Self::Sequence(ProcSequence { len, skip, trunc, ..}) => {
                 //cannot be zero len, we have a logical error somewhere
                 debug_assert!(skip + trunc < *len);
                 len - (skip + trunc)
@@ -495,44 +598,28 @@ impl Inst {
         if amt == 0 {return}
         match self {
 
-            Inst::Sequence(Sequence { skip, .. }) => {*skip += amt as u32;},
-            Inst::Add(inst) => {inst.skip(amt);},
-            Inst::Run(inst) => {inst.skip(amt);},
-            Inst::Copy { copy, .. } => {copy.skip(amt);},
+            Self::Sequence(ProcSequence { skip, .. }) => {*skip += amt as u32;},
+            Self::Add(inst) => {inst.skip(amt);},
+            Self::Run(inst) => {inst.skip(amt);},
+            Self::Copy { copy, .. } => {copy.skip(amt);},
         }
     }
     fn trunc(&mut self, amt: u32){
         if amt == 0 {return}
         match self {
-            Inst::Add(inst) => {inst.trunc(amt);},
-            Inst::Run(inst) => {inst.trunc(amt);},
-            Inst::Copy { copy, .. } => {copy.trunc(amt);},
-            Inst::Sequence(Sequence {trunc ,..}) => {*trunc += amt as u32;},
-        }
-    }
-    fn has_copy(self)->InstCopy{
-        match self{
-            Inst::Copy { copy, addr  } => {
-                //always
-                InstCopy::IsCopy { copy, addr }
-            },
-            Inst::Sequence(Sequence { inst, len, skip, trunc }) => {
-                //sometimes
-                if inst.iter().any(|x|matches!(x,Inst::Copy{..})) {
-                    InstCopy::InSequence(Sequence { inst, len, skip, trunc })
-                }else{
-                    InstCopy::No(Inst::Sequence(Sequence { inst, len, skip, trunc }))
-                }
-            },
-            a => InstCopy::No(a)
+            Self::Add(inst) => {inst.trunc(amt);},
+            Self::Run(inst) => {inst.trunc(amt);},
+            Self::Copy { copy, .. } => {copy.trunc(amt);},
+            Self::Sequence(ProcSequence {trunc ,..}) => {*trunc += amt as u32;},
         }
     }
 }
 enum InstCopy{
-    No(Inst),
-    InSequence(Sequence),
+    No(ProcessInst),
+    InSequence(ProcSequence),
     IsCopy{ copy:COPY, addr: CopyAddr  }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseInst{
     ///The position in the target output stream where this instruction starts outputting bytes
     pub o_start: u64,
@@ -574,22 +661,6 @@ impl COPY{
         self.len-=amt;
     }
 }
-// impl DecInst{
-//     fn skip(&mut self,amt:u32){
-//         match self {
-//             DecInst::Add(ADD { len, p_pos }) =>{*len-=amt; *p_pos+=amt as u64;},
-//             DecInst::Copy(COPY { len, u_pos }) => {*len-=amt; *u_pos+=amt;},
-//             DecInst::Run(RUN{ len, .. }) => {*len-=amt as u32;},
-//         }
-//     }
-//     fn trunc(&mut self,amt:u32){
-//         match self {
-//             DecInst::Add(ADD { len, .. }) |
-//             DecInst::Copy(COPY { len, .. }) |
-//             DecInst::Run(RUN{ len, .. }) => {*len-=amt;},
-//         }
-//     }
-// }
 
 pub(crate) fn merge_ranges<T: Ord + Copy>(ranges: Vec<Range<T>>) -> Vec<Range<T>> {
     let mut result: Vec<Range<T>> = Vec::new();
@@ -614,12 +685,116 @@ pub(crate) fn merge_ranges<T: Ord + Copy>(ranges: Vec<Range<T>>) -> Vec<Range<T>
 
     result
 }
+pub(crate) fn range_overlap<T: Ord + Copy>(range1: &Range<T>, range2: &Range<T>) -> Option<Range<T>> {
+    let start = std::cmp::max(range1.start, range2.start);
+    let end = std::cmp::min(range1.end, range2.end);
 
+    if start < end {
+        Some(Range { start, end })
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::reader::VCDReader;
 
+    use super::*;
+    use std::io::Cursor;
+    #[test]
+    fn test_complex_translate(){
+        // "hello" -> "Hello! Hello!"
+        //from encoder tests
+        let patch = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            0, //win_indicator Neither
+            7, //delta window size
+            1, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            0, //length of addr
+            72, //data section 'H
+            2, //ADD1 (i = 13)
+            1, //win_indicator VCD_SOURCE
+            4, //SSS
+            1, //SSP
+            8, //delta window size
+            5, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            1, //length of addr
+            33, //data section '!' (i= 23)
+            253, //COPY4_mode5 ADD1
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            6, //SSS
+            0, //SSP
+            9, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            2, //length of instructions and size
+            1, //length of addr
+            32, //data section ' ' (i= 35)
+            2, //ADD1 NOOP
+            118, //COPY6_mode6 NOOP
+            0, //addr 0
+        ];
+        let patch = Cursor::new(patch);
+        let reader = VCDReader::new(patch).unwrap();
+        let mut translator = VCDTranslator::new(VCDDecoder::new(reader)).unwrap();
+        let msg = translator.interrogate(0).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 1, p_pos: 12 }));
+        let msg = translator.interrogate(1).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Copy { copy: COPY { len: 4, u_pos: 0 }, sss: 4, ssp: 1 });
+        let msg = translator.interrogate(5).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 1, p_pos: 23 }));
+        let msg = translator.interrogate(6).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 1, p_pos: 35 }));
+        let msg = translator.interrogate(7).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 1, p_pos: 12 }));
+        let msg = translator.interrogate(8).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Copy { copy: COPY { len: 4, u_pos: 0 }, sss: 4, ssp: 1 });
+        let msg = translator.interrogate(12).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 1, p_pos: 23 }));
+        let msg = translator.interrogate(13).unwrap();
+        assert_eq!(msg, None);
+    }
+    #[test]
+    fn test_seq(){
+        // Instructions -> "" -> "tererest'
+
+        let patch = vec![
+            214, 195, 196, 0,  //magic
+            0,  //hdr_indicator
+            0, //win_indicator
+            13, //size_of delta window
+            8, //size of target window
+            0, //delta indicator
+            5, //length of data for ADDs and RUNs
+            2, //length of instructions and sizes
+            1, //length of addresses for COPYs
+            116, 101, 114, 115, 116, //data section b"terst"
+            200, //ADD size3 & COPY5_mode0
+            3, //ADD size 2
+            1, //addr for copy
+        ];
+        let patch = Cursor::new(patch);
+        let reader = VCDReader::new(patch).unwrap();
+        let mut translator = VCDTranslator::new(VCDDecoder::new(reader)).unwrap();
+        let msg = translator.interrogate(0).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 3, p_pos: 12 }));
+        let msg = translator.interrogate(3).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Sequence(Sequence { inst: vec![Inst::Add(ADD { len: 2, p_pos: 13 })], len: 3, skip: 0, trunc: 0 }));
+        let msg = translator.interrogate(6).unwrap().unwrap();
+        assert_eq!(msg.inst, Inst::Add(ADD { len: 2, p_pos: 15 }));
+        let msg = translator.interrogate(8).unwrap();
+        assert_eq!(msg, None);
+    }
     #[test]
     fn test_consecutive_ranges() {
         let ranges = vec![

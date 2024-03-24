@@ -11,10 +11,24 @@ pub enum DecInst{
     Run(RUN)
 }
 impl DecInst{
-    pub fn len(&self)->usize{
+    pub fn len_in_u(&self)->usize{
         (match self{
             DecInst::Add(a) => a.len,
             DecInst::Copy(c) => c.len,
+            DecInst::Run(r) => r.len
+        }) as usize
+    }
+    pub fn len_in_t(&self, cur_u_pos:usize)->usize{
+        (match self{
+            DecInst::Add(a) => a.len,
+            DecInst::Copy(COPY { len, u_pos }) => {
+                let u_end = u_pos + len;
+                if u_end as usize > cur_u_pos{
+                    u_end - cur_u_pos as u32
+                }else{
+                    *len
+                }
+            },
             DecInst::Run(r) => r.len
         }) as usize
     }
@@ -29,7 +43,9 @@ impl DecInst{
         }
     }
 }
+impl DecInst{
 
+}
 
 
 ///This works as a decoder for the VCDIFF format.
@@ -111,15 +127,14 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 let len = if size == 0 {
                     self.reader.read_as_inst_size_unchecked()?
                 }else{size as u64};
-                //is 'here' u_pos or o_pos? Should be u, as a COPY cannot apply to a different window directly
-                //so this should be changed?
-                //TODO figure out a test to see what this should be.
-                let (addr,read) = self.caches.addr_decode(self.reader.get_reader(self.addr_pos)?, self.cur_u_position, mode as usize)?;
-                self.addr_pos += read as u64;
-                self.cur_o_position += len;
-                self.cur_u_position += len;
 
+                let (addr,read) = self.caches.addr_decode(self.reader.get_reader(self.addr_pos)?, self.cur_u_position, mode as usize)?;
                 let inst = DecInst::Copy(COPY { len: len as u32, u_pos: addr as u32 });
+                self.addr_pos += read as u64;
+                let len_t = inst.len_in_t(self.cur_u_position as usize) as u64;
+                self.cur_o_position += len_t;
+                self.cur_u_position += len_t;
+
                 Some(inst)
             },
             TableInst::NoOp => None,
@@ -231,5 +246,49 @@ mod test_super {
             assert_eq!(msg, check, "{:?} != {:?}", msg, check);
         }
     }
+    #[test]
+    fn test_seq(){
+        // Instructions -> "" -> "tererest'
 
+        let patch = vec![
+            214, 195, 196, 0,  //magic
+            0,  //hdr_indicator
+            0, //win_indicator
+            13, //size_of delta window
+            8, //size of target window
+            0, //delta indicator
+            5, //length of data for ADDs and RUNs
+            2, //length of instructions and sizes
+            1, //length of addresses for COPYs
+            116, 101, 114, 115, 116, //data section b"terst" 12..17
+            200, //ADD size3 & COPY5_mode0
+            3, //ADD size 2
+            1, //addr for copy
+        ];
+        let patch = std::io::Cursor::new(patch);
+        let reader = VCDReader::new(patch).unwrap();
+        let mut dec = VCDDecoder::new(reader);
+        let insts = [
+            VCDiffDecodeMsg::WindowSummary(WindowSummary{
+                source_segment_size: None,
+                source_segment_position: None,
+                length_of_the_delta_encoding: 13,
+                size_of_the_target_window: 8,
+                delta_indicator: DeltaIndicator::from_u8(0),
+                length_of_data_for_adds_and_runs: 5,
+                length_of_instructions_and_sizes: 2,
+                length_of_addresses_for_copys: 1,
+                win_start_pos: 5,
+                win_indicator: WinIndicator::Neither,
+            }),
+            VCDiffDecodeMsg::Inst{o_start: 0, first: DecInst::Add(ADD{len: 3, p_pos: 12}), second: Some(DecInst::Copy(COPY { len:5, u_pos:1 }))},
+            VCDiffDecodeMsg::Inst{o_start: 6, first: DecInst::Add(ADD{len: 2, p_pos: 15}), second: None},
+            VCDiffDecodeMsg::EndOfWindow,
+            VCDiffDecodeMsg::EndOfFile,
+        ];
+        for check in insts.into_iter(){
+            let msg = dec.next().unwrap();
+            assert_eq!(msg, check, "{:?} != {:?}", msg, check);
+        }
+    }
 }

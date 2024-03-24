@@ -1,6 +1,6 @@
 use std::{fmt::Debug, io::{Read,Seek,Write}, ops::{Bound, Range, RangeBounds}};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges}, ADD, COPY, RUN};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
 
 pub fn apply_patch<R:Read+Seek+Debug,W:Write>(mut patch:R,mut src:Option<R>,mut sink:W) -> std::io::Result<()> {
     //to avoid the Read+Seek bound on sink,
@@ -54,7 +54,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(mut patch:R,mut src:Option<R>,mut 
                 for inst in [Some(first),second]{
                     if inst.is_none() {break;}
                     let inst = inst.unwrap();
-                    let len = inst.len();
+                    let len = inst.len_in_u();
                     match inst {
                         DecInst::Add(ADD{ p_pos,.. }) => {
                             let patch_r = decoder.reader().get_reader(p_pos)?;
@@ -314,13 +314,8 @@ pub(crate) fn find_intersections<T: Ord + Copy>(reference_set: &Range<T>, test_s
     let mut intersections = Vec::new();
 
     for test_set in test_sets {
-        // Calculate potential overlap
-        let start_overlap = std::cmp::max(reference_set.start, test_set.start);
-        let end_overlap = std::cmp::min(reference_set.end, test_set.end);
-
-        // If an overlap exists, add it to the intersections list
-        if start_overlap <= end_overlap {
-            intersections.push(Range { start: start_overlap, end: end_overlap });
+        if let Some(overlap) = range_overlap(&reference_set, test_set) {
+            intersections.push(overlap);
         }
     }
 

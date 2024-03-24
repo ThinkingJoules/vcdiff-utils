@@ -40,7 +40,7 @@ impl<W: Write> VCDEncoder<W> {
         })
     }
     fn cur_u_pos(&self) -> u32 {
-        self.cur_win.as_ref().unwrap().source_segment_position.unwrap_or(0) as u32 + self.cur_t_size
+        self.cur_win.as_ref().unwrap().source_segment_size.unwrap_or(0) as u32 + self.cur_t_size
     }
     fn last_idx(&self) -> usize {
         // +2 = -1
@@ -67,6 +67,7 @@ impl<W: Write> VCDEncoder<W> {
     ///This will fire off the unwritten buffered instruction encodings if the current slot has an instruction
     ///Otherwise it will just add the instruction to the empty slot in the buffer
     fn add_inst(&mut self,inst:EncInst) {
+
         //if cur pos is some, then we need to encode it and maybe it's successor
         if self.buffer[self.next_idx()].is_some() {
             self.encode_insts(0);//try to write 1 or 2 instructions
@@ -80,6 +81,7 @@ impl<W: Write> VCDEncoder<W> {
         let idx = (self.buffer_pos + offset) % 3;
         //if nothing exists at idx we do nothing
         if let Some(inst) = self.buffer[idx].as_ref() {
+            let cur_inst_len = inst.len_in_t(self.cur_u_pos());
             // 1. Mode Retrieval (For COPY)
             let (f_addr,f_mode) = match &inst {
                 EncInst::COPY(copy) => {
@@ -88,17 +90,18 @@ impl<W: Write> VCDEncoder<W> {
                 },
                 EncInst::ADD(_) => (0,0), //ADD pass through
                 a => {//RUN short circuit
-                    let first = TableInst::from_enc_inst(Some(a),0);
+                    let first = TableInst::from_enc_inst_first(a,0);
                     self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),None);
                     return;
                 },
             };
             //first inst is not Run, so we need to try the second inst
-            let first = TableInst::from_enc_inst(Some(&inst),f_mode);
+            let first = TableInst::from_enc_inst_first(&inst,f_mode);
             if let Some(next) = self.buffer[(idx + 1) % 3].as_ref() {
+                let sec_here = self.cur_u_pos()+cur_inst_len;
                 let s_mode = match &next {
                     EncInst::COPY(copy) => {
-                        self.caches.peek_addr_encode(copy.u_pos as usize, (self.cur_u_pos()+inst.len()) as usize).1
+                        self.caches.peek_addr_encode(copy.u_pos as usize, sec_here as usize).1
                     },
                     EncInst::RUN(_) => {//run cannot be the second inst, send the first inst through
                         self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),Some(f_addr));
@@ -108,16 +111,16 @@ impl<W: Write> VCDEncoder<W> {
                 };
 
                 // 2. TableInst Creation
-                let second = TableInst::from_enc_inst(Some(next),s_mode);
+                let second = TableInst::from_enc_inst_sec(Some(next),s_mode);
 
                 let table_entry = CodeTableEntry { first, second };
-                match VCD_C_TABLE.iter().skip(163).position(|entry| entry == &table_entry){
-                    Some(from_163) => {
-                        let double_opcode = from_163 as u8 + 163;
-                        self.encode_first_inst(offset, double_opcode, first.size(), Some(f_addr));
-                        self.encode_second_to_buffers(offset + 1, second.size());
-                    },
-                    None => self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),Some(f_addr)),
+                let start_offset = if table_entry.sec_is_noop() {0}else{163};
+                //this should always find a code in the standard table
+                let code_pos = VCD_C_TABLE.iter().skip(start_offset).position(|entry| entry == &table_entry).unwrap();
+                let op_code = (code_pos + start_offset) as u8;
+                self.encode_first_inst(offset, op_code, first.size(), Some(f_addr));
+                if !table_entry.sec_is_noop() {
+                    self.encode_second_to_buffers(offset + 1, second.size());
                 }
             }else{//second doesn't exist, just encode the first
                 self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),Some(f_addr));
@@ -133,7 +136,7 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx this will panic
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        self.cur_t_size += inst.len();
+        self.cur_t_size += inst.len_in_t(self.cur_u_pos());
         self.inst_buffer.push(op_code);
         self.encode_inst_to_buffers(inst, size, addr);
     }
@@ -146,18 +149,19 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx we do nothing
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
+        let inst_len = inst.len_in_t(self.cur_u_pos());
         let addr = if let EncInst::COPY(COPY { u_pos, .. }) = &inst {
             Some(self.caches.addr_encode(*u_pos as usize, self.cur_u_pos() as usize).0)
         } else { None };
         //this must be after the addr calculation
-        self.cur_t_size += inst.len();
+        self.cur_t_size += inst_len;
         self.encode_inst_to_buffers(inst, size, addr)
     }
     ///This function takes an EncInst and splits it into the 3 buffers
     ///It DOES NOT increment the cur_t_size or change the unwritten buffer in any way.
     fn encode_inst_to_buffers(&mut self, inst:EncInst, size:u8, addr:Option<u32>) {
         if size == 0 {
-            encode_integer(&mut self.inst_buffer, inst.len() as u64).unwrap();
+            encode_integer(&mut self.inst_buffer, inst.len_in_u() as u64).unwrap();
         }
         match inst {
             EncInst::ADD(data) => {
@@ -276,7 +280,22 @@ pub enum EncInst{
 }
 
 impl EncInst {
-    fn len(&self) -> u32 {
+    fn len_in_t(&self,cur_u_pos:u32) -> u32 {
+        match self {
+            EncInst::ADD(data) => data.len() as u32,
+            EncInst::RUN(run) => run.len,
+            EncInst::COPY(COPY { len, u_pos }) =>{
+                let u_pos = *u_pos as u32;
+                let end = u_pos + *len;
+                if end > cur_u_pos {
+                    end - cur_u_pos
+                }else{
+                    *len
+                }
+            },
+        }
+    }
+    fn len_in_u(&self) -> u32 {
         match self {
             EncInst::ADD(data) => data.len() as u32,
             EncInst::RUN(run) => run.len,
@@ -297,22 +316,75 @@ impl EncInst {
         }
     }
 }
+impl CodeTableEntry{
+    fn sec_is_noop(&self) -> bool {
+        self.second == TableInst::NoOp
+    }
+}
 
 impl TableInst{
-    fn from_enc_inst(inst:Option<&EncInst>,mode:u8) -> Self {
+    fn from_enc_inst_first(inst:&EncInst,mode:u8) -> Self {
+        let len = inst.len_in_u();
+        let mut size = if len > u8::MAX as u32{
+            0
+        } else {
+            len as u8
+        };
+        match inst {
+            EncInst::ADD(_) => {
+                if !(1..=17).contains(&size) {
+                    size = 0;
+                }
+                TableInst::Add { size }
+            },
+            EncInst::RUN(_) => TableInst::Run,
+            EncInst::COPY(_) => {
+                if !(4..=18).contains(&size) {
+                    size = 0;
+                }
+                TableInst::Copy { size, mode }
+            },
+        }
+    }
+    fn from_enc_inst_sec(inst:Option<&EncInst>,mode:u8) -> Self {
         if inst.is_none() {
             return TableInst::NoOp;
         }
         let inst = inst.unwrap();
-        let size = if inst.len() > u8::MAX as u32{
+        let len = inst.len_in_u();
+        let size = if len > u8::MAX as u32{
             0
         } else {
-            inst.len() as u8
+            len as u8
         };
         match inst {
-            EncInst::ADD(_) => TableInst::Add { size },
-            EncInst::RUN(_) => TableInst::Run,
-            EncInst::COPY(_) => TableInst::Copy { size, mode },
+            EncInst::COPY(_) => {
+                match mode {
+                    0..=5 => {
+                        if (4..=6).contains(&size) {
+                            TableInst::Copy { size, mode }
+                        }else{
+                            TableInst::NoOp
+                        }
+                    },
+                    6..=8 => {
+                        if size == 4{
+                            TableInst::Copy { size, mode }
+                        }else{
+                            TableInst::NoOp
+                        }
+                    },
+                    _ => TableInst::NoOp,
+                }
+            },
+            EncInst::ADD(_) => {
+                if size == 1 {
+                    TableInst::Add { size }
+                }else{
+                    TableInst::NoOp
+                }
+            },
+            EncInst::RUN(_) => TableInst::NoOp,
         }
     }
     fn size(&self) -> u8 {
@@ -402,7 +474,48 @@ mod test_super {
         assert_eq!(w, answer);
 
     }
+    #[test]
+    fn test_basic_add_seq() {
+        // Setup
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
 
+        // Create a new window
+        let win_hdr = WindowHeader {
+            win_indicator: WinIndicator::Neither,
+            source_segment_size: None,
+            source_segment_position: None,
+            size_of_the_target_window: 8,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(win_hdr).unwrap();
+
+        // Instructions -> "" -> "tererest'
+        encoder.next_inst(EncInst::ADD(vec![b't',b'e',b'r'])).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 1 })).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b's',b't'])).unwrap();
+
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        let answer = vec![
+            214, 195, 196, 0,  //magic
+            0,  //hdr_indicator
+            0, //win_indicator
+            13, //size_of delta window
+            8, //size of target window
+            0, //delta indicator
+            5, //length of data for ADDs and RUNs
+            2, //length of instructions and sizes
+            1, //length of addresses for COPYs
+            116, 101, 114, 115, 116, //data section b"terst"
+            200, //ADD size3 & COPY5_mode0
+            3, //ADD size 2
+            1, //addr for copy
+        ];
+        assert_eq!(w, answer);
+
+    }
     #[test]
     fn test_hello_transformation() {
         // Setup
