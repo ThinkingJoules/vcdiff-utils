@@ -4,16 +4,19 @@ use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_heade
 
 
 
-pub fn gather_summaries<R: Read + Seek>(mut patch_data:R)-> std::io::Result<Vec<WindowSummary>>{
-    let header = read_header(&mut patch_data)?;
+pub fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec<WindowSummary>>{
+    let header = read_header(patch_data)?;
     let mut summaries = Vec::new();
-    while let Ok(ws) = read_window_header(&mut patch_data, header.encoded_size() as u64) {
+    let mut win_start_pos = header.encoded_size() as u64;
+    while let Ok(ws) = read_window_header(patch_data, win_start_pos) {
+        win_start_pos = ws.end_of_window();
         summaries.push(ws);
+        patch_data.seek(std::io::SeekFrom::Start(win_start_pos))?;
     }
     Ok(summaries)
 }
 
-fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
+pub fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
     let mut ranges = Vec::new();
     for ws in summaries.iter().rev() {
         if let WinIndicator::VCD_TARGET = ws.win_indicator {
@@ -22,6 +25,7 @@ fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
             ranges.push(ssp..ssp+sss);
         }
     }
+    let mut ranges = merge_ranges(ranges);
     //sort with the smallest last
     ranges.sort_by(|a,b|a.start.cmp(&b.start));
     ranges
@@ -63,8 +67,8 @@ pub struct VCDTranslator<R>{
 }
 
 impl<R:Read+Seek> VCDTranslator<R> {
-    pub fn new(decoder: VCDDecoder<R>, patch_reader:R) -> std::io::Result<Self> {
-        let windows = gather_summaries(patch_reader)?;
+    pub fn new(decoder: VCDDecoder<R>, mut patch_reader:R) -> std::io::Result<Self> {
+        let windows = gather_summaries(&mut patch_reader)?;
         let dependencies = find_dep_ranges(&windows);
         Ok(VCDTranslator {
             decoder,
@@ -587,3 +591,98 @@ impl COPY{
 //     }
 // }
 
+pub(crate) fn merge_ranges<T: Ord + Copy>(ranges: Vec<Range<T>>) -> Vec<Range<T>> {
+    let mut result: Vec<Range<T>> = Vec::new();
+    let mut sorted_ranges = ranges;
+
+    // 1. Sort the ranges by their start values
+    sorted_ranges.sort_by(|a, b| a.start.cmp(&b.start));
+
+    // 2. Iterate through the sorted ranges
+    for range in sorted_ranges {
+        // 3. If the result list is empty or the current range doesn't overlap
+        //    with the last range in the result, simply add it to the result.
+        if result.is_empty() || range.start > result.last().unwrap().end {
+            result.push(range);
+        } else {
+            // 4. Overlap exists: Extend the end of the last range in the result
+            //    to the maximum end of the overlapping ranges.
+            let last_index = result.len() - 1;
+            result[last_index].end = std::cmp::max(result[last_index].end, range.end);
+        }
+    }
+
+    result
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_consecutive_ranges() {
+        let ranges = vec![
+            Range { start: 1, end: 3 },
+            Range { start: 3, end: 5 },
+        ];
+        let expected = vec![Range { start: 1, end: 5 }];
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+
+    #[test]
+    fn test_overlapping_ranges() {
+        let ranges = vec![
+            Range { start: 5, end: 10 },
+            Range { start: 3, end: 8 },
+            Range { start: 10, end: 12 },
+        ];
+        let expected = vec![Range { start: 3, end: 12 }];
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+
+    #[test]
+    fn test_nested_ranges() {
+        let ranges = vec![
+            Range { start: 1, end: 10 },
+            Range { start: 2, end: 5 },
+        ];
+        let expected = vec![Range { start: 1, end: 10 }];
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+
+    #[test]
+    fn test_disjoint_ranges() {
+        let ranges = vec![
+            Range { start: 1, end: 3 },
+            Range { start: 5, end: 7 },
+            Range { start: 10, end: 12 },
+        ];
+        let expected = ranges.clone(); // No merging happens
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+
+    #[test]
+    fn test_all(){
+        let ranges = vec![
+            Range { start: 5, end: 10 },
+            Range { start: 3, end: 8 },
+            Range { start: 9, end: 12 },
+            Range { start: 1, end: 10 },
+            Range { start: 2, end: 5 },
+            Range { start: 1, end: 3 },
+            Range { start: 5, end: 7 },
+            Range { start: 10, end: 12 },
+            Range { start: 15, end: 30 },
+        ];
+        let expected = vec![Range { start: 1, end: 12 },Range { start: 15, end: 30 }];
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let ranges: Vec<Range<u64>> = vec![];
+        let expected: Vec<Range<u64>> = vec![];
+        assert_eq!(merge_ranges(ranges), expected);
+    }
+}

@@ -80,7 +80,6 @@ impl<W: Write> VCDEncoder<W> {
         let idx = (self.buffer_pos + offset) % 3;
         //if nothing exists at idx we do nothing
         if let Some(inst) = self.buffer[idx].as_ref() {
-            dbg!(inst);
             // 1. Mode Retrieval (For COPY)
             let (f_addr,f_mode) = match &inst {
                 EncInst::COPY(copy) => {
@@ -424,13 +423,13 @@ mod test_super {
         // Instructions
         // "hello" -> "Hello! Hello!"
         encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap(); // Add 'H'
-        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 1 })).unwrap(); // Copy 'ello'
+        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap(); // Copy 'ello'
         encoder.next_inst(EncInst::ADD(vec![b'!', b' '])).unwrap(); // Add '! '
         encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 4  })).unwrap(); // Copy "Hello!"
 
         // Force encoding (remains the same)
         let w = encoder.finish().unwrap().into_inner();
-        dbg!(&w);
+        //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
             0, //hdr_indicator
@@ -444,13 +443,130 @@ mod test_super {
             2, //length of instructions and sizes
             2, //length of addresses for COPYs
             72,33,32, //'H! ' data section
-            163, //ADD1 COPY4_mode0
-            189, //ADD2 COPY6_mode2
-            1,
-            3,
+            235, //ADD1 COPY4_mode6
+            183, //ADD2 COPY6_mode0
+            0,
+            4,
         ];
 
         assert_eq!(w, answer);
+    }
+    #[test]
+    pub fn neither_win(){
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let n_window = WindowHeader {
+            win_indicator: WinIndicator::Neither,
+            source_segment_size: None,
+            source_segment_position: None,
+            size_of_the_target_window: 1,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(n_window).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
+        let w = encoder.finish().unwrap().into_inner();
+        //dbg!(&w);
+        let answer = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            0, //win_indicator Neither
+            7, //delta window size
+            1, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            0, //length of addr
+            72, //data section
+            2, //ADD1
+        ];
+        assert_eq!(w, answer);
+    }
+    #[test]
+    pub fn complex_transform(){
+        //we need 3 windows, Neither, Src, and Target, in that order.
+        //src will be 'hello' and output will be 'Hello! Hello!'
+        //we encode just the Add(H) in the Neither window
+        //then we encode the COPY(ello) in the Src window
+        //then we encode the Copy(Hello!) in the Target window
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let n_window = WindowHeader {
+            win_indicator: WinIndicator::Neither,
+            source_segment_size: None,
+            source_segment_position: None,
+            size_of_the_target_window: 1,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(n_window).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
+        let s_window = WindowHeader {
+            win_indicator: WinIndicator::VCD_SOURCE,
+            source_segment_size: Some(4),
+            source_segment_position: Some(1),
+            size_of_the_target_window: 5,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(s_window).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b'!'])).unwrap();
+        let t_window = WindowHeader {
+            win_indicator: WinIndicator::VCD_TARGET,
+            source_segment_size: Some(6),
+            source_segment_position: Some(0),
+            size_of_the_target_window: 7,
+            delta_indicator: DeltaIndicator::default(),
+        };
+        encoder.start_new_win(t_window).unwrap();
+        encoder.next_inst(EncInst::ADD(vec![b' '])).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 0 })).unwrap();
+
+        let w = encoder.finish().unwrap().into_inner();
+        //dbg!(&w);
+        let answer = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            0, //win_indicator Neither
+            7, //delta window size
+            1, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            0, //length of addr
+            72, //data section 'H
+            2, //ADD1
+            1, //win_indicator VCD_SOURCE
+            4, //SSS
+            1, //SSP
+            8, //delta window size
+            5, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            1, //length of instructions and size
+            1, //length of addr
+            33, //data section '!'
+            253, //COPY4_mode5 ADD1
+            0, //addr 0
+            2, //win_indicator VCD_TARGET
+            6, //SSS
+            0, //SSP
+            9, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            2, //length of instructions and size
+            1, //length of addr
+            32, //data section ' '
+            2, //ADD1 NOOP
+            118, //COPY6_mode6 NOOP
+            0, //addr 0
+        ];
+
+        assert_eq!(w, answer);
+
+
+
     }
 
 }

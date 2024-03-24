@@ -36,6 +36,7 @@ impl DecInst{
 ///It can only advance forward in the output stream.
 ///You simply ask for the byte we are interrogating.
 ///It will return the DecodedInstruction that control that byte in the output stream.
+#[derive(Debug)]
 pub struct VCDDecoder<R> {
     caches: Cache,
     ///The monotonic Reader for scanning the VCDIFF file
@@ -67,6 +68,9 @@ impl<R: Read + Seek> VCDDecoder<R> {
             cur_o_position: 0,
             cur_u_position: 0,
         }
+    }
+    pub fn reader(&mut self) -> &mut VCDReader<R> {
+        &mut self.reader
     }
     pub fn position(&self) -> u64 {
         self.cur_o_position

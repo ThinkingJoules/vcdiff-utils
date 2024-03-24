@@ -10,6 +10,7 @@ enum VCDiffState {
     EoW,
     EoF,
 }
+#[derive(Debug)]
 pub struct VCDReader<R> {
     source: R,
     pub header: Header,
@@ -25,6 +26,7 @@ impl<R: Read + Seek> VCDReader<R> {
     /// an error is returned.
     pub fn new(mut source: R) -> io::Result<Self> {
         // Attempt to read and validate the VCDIFF header.
+        source.seek(io::SeekFrom::Start(0))?;
         let header = read_header(&mut source)?;
         if let Some(_) = header.code_table_data.as_ref(){
             unimplemented!("Application-Defined Code Tables are not supported.")

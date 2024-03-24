@@ -541,7 +541,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Copy { size: 0, mode: 6 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 4, mode: 6 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 5, mode: 6 }, second: NoOp },
-    CodeTableEntry { first: Copy { size: 6, mode: 6 }, second: NoOp },
+    CodeTableEntry { first: Copy { size: 6, mode: 6 }, second: NoOp }, //118
     CodeTableEntry { first: Copy { size: 7, mode: 6 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 8, mode: 6 }, second: NoOp },
     CodeTableEntry { first: Copy { size: 9, mode: 6 }, second: NoOp },
@@ -615,8 +615,8 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 2 } }, //189
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 3 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 3 } },
-    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 3 } }, //193
-    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 4 } },
+    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 3 } },
+    CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 4 } }, //193
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 5, mode: 4 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 6, mode: 4 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 5 } },
@@ -625,8 +625,8 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 0 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 0 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 0 } },
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 1 } }, //203
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 1 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 1 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 1 } }, //203
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 1 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 2 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 2 } },
@@ -635,8 +635,8 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 3 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 3 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 4 } },
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 4 } }, //213
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 4 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 4 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 4 } }, //213
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 5 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 5, mode: 5 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 6, mode: 5 } },
@@ -645,8 +645,8 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 0 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 1 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 1 } },
-    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 1 } }, //223
-    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 2 } },
+    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 1 } },
+    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 2 } }, //223
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 2 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 2 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 3 } },
@@ -656,9 +656,9 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 4 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 4 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 5 } },
-    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 5 } },
+    CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 5, mode: 5 } }, //233
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 6, mode: 5 } },
-    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 6 } },
+    CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 6 } }, //235
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 7 } },
     CodeTableEntry { first: Add { size: 1 }, second: Copy { size: 4, mode: 8 } },
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 6 } },
@@ -666,7 +666,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Add { size: 2 }, second: Copy { size: 4, mode: 8 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 6 } },
     CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 7 } },
-    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 8 } },
+    CodeTableEntry { first: Add { size: 3 }, second: Copy { size: 4, mode: 8 } }, //243
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 6 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 7 } },
     CodeTableEntry { first: Add { size: 4 }, second: Copy { size: 4, mode: 8 } },
@@ -675,7 +675,7 @@ pub const VCD_C_TABLE: [CodeTableEntry;256] = [
     CodeTableEntry { first: Copy { size: 4, mode: 2 }, second: Add { size: 1 } },
     CodeTableEntry { first: Copy { size: 4, mode: 3 }, second: Add { size: 1 } },
     CodeTableEntry { first: Copy { size: 4, mode: 4 }, second: Add { size: 1 } },
-    CodeTableEntry { first: Copy { size: 4, mode: 5 }, second: Add { size: 1 } },
+    CodeTableEntry { first: Copy { size: 4, mode: 5 }, second: Add { size: 1 } }, //253
     CodeTableEntry { first: Copy { size: 4, mode: 6 }, second: Add { size: 1 } },
     CodeTableEntry { first: Copy { size: 4, mode: 7 }, second: Add { size: 1 } },
     CodeTableEntry { first: Copy { size: 4, mode: 8 }, second: Add { size: 1 } }
