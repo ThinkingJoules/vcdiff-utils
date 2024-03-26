@@ -4,7 +4,7 @@ use crate::{encode_integer, integer_encoded_size, reader::{DeltaIndicator, Heade
 
 
 #[derive(Debug)]
-pub struct VCDEncoder<W:Write> {
+pub struct VCDEncoder<W> {
     sink:W,
     caches: Cache,
     //circular buffer of last 3 instructions

@@ -31,6 +31,42 @@ pub struct RUN{
     pub byte: u8
 }
 
+impl ADD{
+    pub fn len(&self)->u32{
+        self.len
+    }
+    pub fn skip(&mut self,amt:u32){
+        self.len-=amt;
+        self.p_pos+=amt as u64;
+    }
+    pub fn trunc(&mut self,amt:u32){
+        self.len-=amt;
+    }
+}
+impl RUN{
+    pub fn len(&self)->u32{
+        self.len
+    }
+    pub fn skip(&mut self,amt:u32){
+        self.len-=amt as u32;
+    }
+    pub fn trunc(&mut self,amt:u32){
+        self.len-=amt;
+    }
+}
+impl COPY{
+    pub fn len_in_u(&self)->u32{
+        self.len
+    }
+    pub fn skip(&mut self,amt:u32){
+        self.len-=amt;
+        self.u_pos+=amt;
+    }
+    pub fn trunc(&mut self,amt:u32){
+        self.len-=amt;
+    }
+}
+
 #[derive(Debug)]
 pub struct Cache {
     near: [usize; Self::S_NEAR], // Fixed array size of 4
