@@ -31,9 +31,10 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
             cur_inst:None,
         })
     }
-    pub fn merge_patches(&mut self) -> std::io::Result<()> {
+    pub fn merge_patches(mut self) -> std::io::Result<W> {
         // Main loop: Iterate through positions until all patches are applied
         while let Some(instruction) = self.find_cntl_inst_for_position(self.crsr_o_pos)? {
+            dbg!(&instruction,self.cur_o_pos,self.crsr_o_pos,&self.cur_inst);
             match (instruction,&self.cur_inst){
                 (Ok(inst), None) => {
                     //we are at the top level loop, inst is root (Ok(_))
@@ -71,7 +72,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
 
         // Final flush to write out any remaining instructions in the current window
         self.flush_window()?;
-        Ok(())
+        Ok(self.sink.finish()?)
     }
     fn continue_copy_resolution(&mut self,next_inst:CopyRootResolve)->std::io::Result<()>{
         //we are in a copy resolve, and encountered a copy-like control inst
@@ -134,7 +135,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         let ResolveCopy{mut inst, cur_check_len, patch_index} = self.cur_inst.take().expect("cur_inst should be set here");
         let trunc = inst.len() as u32 - cur_check_len;
         inst.trunc(trunc as u32);   // Truncate per the position of the root inst
-        self.crsr_o_pos += inst.len() as u64;
+        //self.crsr_o_pos += inst.len() as u64; //we already advanced this inst?
         debug_assert_eq!(self.crsr_o_pos, self.cur_o_pos + inst.len() as u64, "crsr_o_pos: {} cur_o_pos: {}", self.crsr_o_pos, self.cur_o_pos);
         self.apply_instruction(ControlInst{inst, patch_index,output_start_pos:self.cur_o_pos})
     }
@@ -201,6 +202,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         self.cur_o_pos += inst.len() as u64;
         //adjust our current window
         let (src_range,trgt_win_size) = self.new_win_sizes(&inst);
+        dbg!(inst,src_range,trgt_win_size);
         let ws = self.win_sum.get_or_insert(Default::default());
         if let Some((ssp,sss)) = src_range {
             ws.source_segment_position = Some(ssp);
@@ -248,7 +250,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         // Write out the current window
         let ws = self.win_sum.take().expect("win_sum should be set here");
         let output_ssp = ws.source_segment_position.clone();
-        self.sink.start_new_win(self.win_sum.take().unwrap())?;
+        self.sink.start_new_win(ws)?;
         for MergedInst { inst, patch_index } in self.cur_win.drain(..) {
             match inst {
                 RootInst::Add(ADD { len, p_pos }) => {
@@ -264,7 +266,8 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
                     //we need to translate this so our u_pos is correct
                     let output_ssp = output_ssp.expect("output_ssp should be set here");
                     //our ssp is within (or coincident) to the bounds of the source segment
-                    let shift = ssp - output_ssp; //lower bound should be 0;
+                    let zero_u_pos = u_pos as u64 + ssp;
+                    let shift = zero_u_pos - output_ssp; //lower bound should be 0;
                     self.sink.next_inst(EncInst::COPY(COPY { len, u_pos: u_pos + shift as u32})).unwrap();
                 },
             }
@@ -388,6 +391,7 @@ impl CopyInst{
     }
 
 }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct CopyRootResolve{
     inst: RootInst,
     patch_index:usize,
@@ -459,7 +463,9 @@ impl DisCopy {
     fn min_src(&self)->Range<u64>{
         let Self{copy:COPY { len, u_pos },sss,ssp} = self;
         assert!(u_pos + len <= (ssp+sss) as u32); //make sure we are within the bounds of S in U
-        (*u_pos as u64 + ssp)..(sss-*u_pos as u64)
+        let new_ssp = *ssp + *u_pos as u64;
+        let new_end = new_ssp + *len as u64;
+        new_ssp..new_end
     }
     fn max_u_trunc_amt(&self,max_space_avail:u32)->u32{
         //can we figure out how much to truncate to fit in the space?
@@ -560,8 +566,127 @@ fn get_disjoint_range<T: Ord + Debug>(range1: Range<T>, range2: Range<T>) -> Opt
 
 #[cfg(test)]
 mod test_super {
-    use super::*;
+    use crate::{applicator::apply_patch, decoder::VCDDecoder, reader::{DeltaIndicator, VCDReader}};
 
+    use super::*;
+    /*
+    All the merger tests will start with a src file of 'hello'
+    We will then create a series of patches that will make certain *changes* to the file.
+    That is, we want to be able to apply them in different orders for different effects.
+    To this end, all of the target windows must be the same size.
+    We will pick 10 bytes as our target window size. This is twice the length of 'hello'
+
+    We need to test the following:
+    Sequence unrolling
+    Copy Passthrough
+    Add/Run precedence
+
+    For the seq:
+    We will simply make a patch that will take the last four bytes and sequence them to len 10.
+    This should turn '01234' into '1234123412'
+
+    For the copy:
+    We will make a patch that will copy the first five bytes to the last five bytes.
+    This should turn '01234' into '0123401234'
+
+    For the add/run:
+    We will make a patch that will insert 'XXX'(Run) + 'YZ'(Add) after the first char
+    This should turn '01234' into '0XXXYZ1234'
+
+    We can then mix and match these patches and we should be able to reason about the outputs.
+    */
+    const HDR:Header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+    const WIN_HDR:WindowHeader = WindowHeader {
+        win_indicator: WinIndicator::VCD_SOURCE,
+        source_segment_size: Some(5),
+        source_segment_position: Some(0),
+        size_of_the_target_window: 10,
+        delta_indicator: DeltaIndicator(0),
+    };
+    use std::io::Cursor;
+    fn make_translator(patch_bytes:Vec<u8>)->VCDTranslator<Cursor<Vec<u8>>>{
+        VCDTranslator::new(VCDDecoder::new(VCDReader::new(Cursor::new(patch_bytes)).unwrap())).unwrap()
+    }
+    fn seq_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 14, u_pos: 1 })).unwrap();
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    fn copy_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    fn add_run_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::RUN(RUN { len: 3, byte: b'X' })).unwrap();
+        encoder.next_inst(EncInst::ADD("YZ".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 1 })).unwrap();
+
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    const SRC:&[u8] = b"01234";
+    #[test]
+    fn test_copy_seq(){
+        let answer = b"0234123412";
+        let copy = copy_patch();
+        let seq = seq_patch();
+        let merger = VCDMerger::new(vec![copy,seq],Vec::new(),None).unwrap();
+        let merged_patch = merger.merge_patches().unwrap();
+        let mut cursor = Cursor::new(merged_patch);
+        let mut output = Vec::new();
+        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        //print output as a string
+        let as_str = std::str::from_utf8(&output).unwrap();
+        println!("{}",as_str);
+        assert_eq!(output,answer);
+    }
+    #[test]
+    fn test_seq_copy_add(){
+        let answer = b"0XXXYZ1234";
+        let seq = seq_patch();
+        let copy = copy_patch();
+        let add_run = add_run_patch();
+        let merger = VCDMerger::new(vec![seq,copy,add_run],Vec::new(),None).unwrap();
+        let merged_patch = merger.merge_patches().unwrap();
+        let mut cursor = Cursor::new(merged_patch);
+        let mut output = Vec::new();
+        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        //print output as a string
+        let as_str = std::str::from_utf8(&output).unwrap();
+        println!("{}",as_str);
+        assert_eq!(output,answer);
+    }
+    #[test]
+    fn test_copy_seq_add(){
+        let answer = b"1XXXYZ3412";
+        let seq = seq_patch();
+        let copy = copy_patch();
+        let add_run = add_run_patch();
+        let merger = VCDMerger::new(vec![copy,seq,add_run],Vec::new(),None).unwrap();
+        let merged_patch = merger.merge_patches().unwrap();
+        let mut cursor = Cursor::new(merged_patch);
+        let mut output = Vec::new();
+        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        //print output as a string
+        let as_str = std::str::from_utf8(&output).unwrap();
+        println!("{}",as_str);
+        assert_eq!(output,answer);
+    }
     #[test]
     fn test_disjoint_ranges() {
         let range1 = 1..5;
@@ -597,5 +722,33 @@ mod test_super {
 
         let result = get_disjoint_range(range1, range2);
         assert_eq!(result, None);
+    }
+    #[test]
+    fn test_get_superset() {
+        // Test Case 1: range1 supersedes range2
+        let range1 = 10..20;
+        let range2 = 12..18;
+        let expected_superset = 10..20;
+        let result = get_superset(range1, range2);
+        assert_eq!(result, expected_superset);
+
+        // Test Case 2: range2 supersedes range1
+        let range1 = 0..2;
+        let range2 = 7..10;
+        let expected_superset = 0..10;
+        let result = get_superset(range1, range2);
+        assert_eq!(result, expected_superset);
+
+        // Test Case 3: Overlapping ranges
+        let range1 = 0..15;
+        let range2 = 10..20;
+        let expected_superset = 0..20;
+        let result = get_superset(range1, range2);
+        assert_eq!(result, expected_superset);
+
+        // Test Case 4: start > end within a range (should never happen)
+        // Option 1: Force the issue if your logic allows it
+        // Option 2: Add a check in the `get_superset` function and expect
+        //         a panic or a Result type return
     }
 }
