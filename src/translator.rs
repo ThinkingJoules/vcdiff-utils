@@ -81,6 +81,12 @@ impl<R:Read+Seek> VCDTranslator<R> {
             cur_u_pos: 0,
         })
     }
+    pub fn cur_o_pos(&self)->u64{
+        self.cur_o_pos
+    }
+    pub fn into_inner(self)->VCDDecoder<R>{
+        self.decoder
+    }
     pub fn get_reader(&mut self, at_from_start:u64)->std::io::Result<&mut R>{
         self.decoder.reader().get_reader(at_from_start)
     }
@@ -156,15 +162,43 @@ impl<R:Read+Seek> VCDTranslator<R> {
     }
 
     fn resolve_copy(&mut self, mut copy: COPY) -> usize {
-        let CopyInfo { mut state, seq, copy_addr } = self.determine_copy_type(&copy);
-        // handle the sequence first? We would reduce the len of the COPY to the pattern
-        // then we would resolve the instructions.
-        if let Some(ImplicitSeq { pattern, .. }) = seq {
-            copy.len = pattern as u32;
-        }
-        let initial = ProcessInst::Copy { copy, addr:copy_addr };
         let mut buf = Vec::with_capacity(15);
-        buf.push(initial);
+
+        let cur_win = self.cur_win().unwrap();
+        let sss = cur_win.source_segment_size.unwrap();
+        let ssp = cur_win.source_segment_position.unwrap();
+        let mut is_seq = None;
+        let in_trgt = cur_win.is_vcd_target();
+        let mut state = if in_trgt { CopyState::TranslateGlobal } else { CopyState::Resolved };
+        if copy.u_pos + copy.len <= sss as u32 { //this cannot be seq
+            buf.push(ProcessInst::Copy { copy, addr: CopyAddr::Source { sss, ssp } });
+        }else{
+            //the next might have seq, we are in s+t
+            let cur_u = self.cur_u_pos as u32;
+            if copy.u_pos + copy.len > cur_u{
+                let pattern = (cur_u - copy.u_pos) as usize;
+                let len_in_t = copy.u_pos + copy.len - cur_u;
+                is_seq = Some(len_in_t);
+                let trunc = copy.len - pattern as u32;
+                copy.trunc(trunc)
+            }
+            if copy.u_pos + copy.len <= sss as u32 {
+                buf.push(ProcessInst::Copy { copy, addr: CopyAddr::Source { sss, ssp } });
+            }else if copy.u_pos < sss as u32{
+                let mut in_s = copy.clone();
+                let len = copy.len as u32;
+                let trunc = copy.u_pos + copy.len - sss as u32;
+                in_s.trunc(trunc);
+                buf.push(ProcessInst::Copy { copy: in_s, addr: CopyAddr::Source { sss, ssp } });
+                let skip = len - trunc;
+                copy.skip(skip);
+                buf.push(ProcessInst::Copy { copy, addr: CopyAddr::Unresolved });
+                state.back(in_trgt)
+            }else{
+                buf.push(ProcessInst::Copy { copy, addr: CopyAddr::Unresolved });
+                state.back(in_trgt)
+            }
+        }
         loop {
             match state {
                 CopyState::TranslateLocal | CopyState::TranslateLocalThenGlobal=> {
@@ -182,7 +216,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         //buf should now contain all the resolved instructions for the given COPY input
         //this might have been a no-op, but we still need to handle the sequence case
         let count = buf.len();
-        if let Some(ImplicitSeq { len, .. }) = seq {
+        if let Some(len) = is_seq {
             self.store_inst(ProcessInst::Sequence(ProcSequence { inst: buf, len: len as u32, skip: 0, trunc: 0}));
         }else{
             self.cur_window_inst.reserve(count);
@@ -232,6 +266,8 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     }
                     //here u_pos should partly be in T of U
                     debug_assert!(u_pos < self.cur_u_pos as u32, "The COPY position is not before our current output position in U");
+                    dbg!(len,u_pos, addr);
+                    //local_slice will only handle COPY entirely in T
                     let mut slice = self.get_local_slice(u_pos, len);
                     // //sanity check for len
                     // debug_assert!(slice.iter().map(|x|x.len_in_u()).sum::<u32>() == len, "The slice length does not match the COPY length");
@@ -245,9 +281,10 @@ impl<R:Read+Seek> VCDTranslator<R> {
         let mut slice = Vec::new();
         let mut pos = 0;
         let src_size = self.cur_t_start().unwrap_or(0) as u32;
+        dbg!(src_size, u_pos, len);
         let t_pos = u_pos - src_size;
         let slice_end = t_pos + len;
-        let range = t_pos..slice_end;
+        let range = u_pos..slice_end;
         for (inst,len_in_t) in self.cur_window_inst.iter() {
             let len = len_in_t;//inst.len_in_t(src_size+pos);
             let cur_inst_end = pos + len;
@@ -343,6 +380,23 @@ impl<R:Read+Seek> VCDTranslator<R> {
             }
         }
     }
+
+    fn copy_is_in(&self,copy:&COPY)->CopyPos{
+        let u_pos = copy.u_pos as u32;
+        let len = copy.len as u32;
+        let cur_win = self.cur_win().unwrap();
+        let sss = cur_win.source_segment_size.unwrap();
+        let ssp = cur_win.source_segment_position.unwrap();
+        let cur_u = self.cur_u_pos as u32;
+
+        if u_pos + len <= sss as u32 {
+            CopyPos::InS { ssp, sss }
+        }else if u_pos < sss as u32{
+            CopyPos::InSAndT { ssp, sss, trunc: u_pos + len - sss as u32 }
+        }else{
+            CopyPos::InT
+        }
+    }
     fn determine_copy_type(&self,copy:&COPY)->CopyInfo{
         //Every COPY can have between 0 and 2 layers of indirection.
         //0: COPY entirely in S in U and VCD_SOURCE
@@ -351,20 +405,23 @@ impl<R:Read+Seek> VCDTranslator<R> {
         //2: COPY in U that overflows or is entirely in T and VCD_TARGET
         //There is an implicit Sequence if COPYs length exceeds our current output position in U
         //This is regardless of where the COPY starts, only where it ends.
-        let COPY { len, u_pos } = copy;
+        let COPY { len, u_pos } = *copy;
         let u_end = u_pos + len;
-        let t_start = self.cur_t_start().unwrap_or(0) as u32;
         let cur_u = self.cur_u_pos as u32;
         let ws = self.cur_win().unwrap();
         let is_trgt = ws.is_vcd_target();
-        let sss = ws.source_segment_size;
-        let ssp = ws.source_segment_position;
-        if u_end <= t_start { // COPY entirely in S in U
-            return CopyInfo {
-                state: if is_trgt { CopyState::TranslateGlobal } else { CopyState::Resolved },
-                seq: None,
-                copy_addr: if is_trgt { CopyAddr::Unresolved  } else { CopyAddr::Source { sss: sss.unwrap(), ssp:ssp.unwrap() } }
-            };
+        match self.copy_is_in(copy){
+            CopyPos::InS { ssp, sss } => {
+                return CopyInfo {
+                    state: if is_trgt { CopyState::TranslateGlobal } else { CopyState::Resolved },
+                    seq: None,
+                    copy_addr: if is_trgt { CopyAddr::Unresolved  } else { CopyAddr::Source { sss, ssp } }
+                };
+            },
+            CopyPos::InSAndT { ssp, sss, trunc } => {
+
+            },
+            CopyPos::InT => todo!(),
         }
         if u_end <= cur_u { // COPY in U that overflows or is entirely in T
             return CopyInfo {
@@ -407,6 +464,12 @@ impl<R:Read+Seek> VCDTranslator<R> {
         self.cur_window_inst.push((inst,len));
     }
 }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CopyPos{
+    InS{ssp:u64,sss:u64},
+    InSAndT{ssp:u64,sss:u64,trunc:u32},
+    InT,
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct ImplicitSeq{
@@ -444,6 +507,22 @@ impl CopyState {
             CopyState::TranslateGlobal => *self = CopyState::Resolved,
             CopyState::TranslateLocalThenGlobal => *self = CopyState::TranslateGlobal,
             _ => unreachable!(),
+        }
+    }
+    fn back(&mut self, in_trgt:bool){
+        if in_trgt{
+            match self{
+                CopyState::Resolved => *self = CopyState::TranslateGlobal,
+                CopyState::TranslateLocal => *self = CopyState::TranslateLocalThenGlobal,
+                CopyState::TranslateGlobal => *self = CopyState::TranslateLocalThenGlobal,
+                _ => panic!("Invalid state transition"),
+            }
+
+        }else{
+            match self{
+                CopyState::Resolved => *self = CopyState::TranslateLocal,
+                _ => panic!("Invalid state transition"),
+            }
         }
     }
 
@@ -538,6 +617,7 @@ enum ProcessInst{
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum CopyAddr{
     Unresolved,
+    TruncateThenResolve{sss:u64, ssp:u64,trunc:u32},
     Source{sss:u64, ssp:u64},
 }
 impl ProcessInst {
@@ -864,5 +944,71 @@ mod tests {
         let ranges: Vec<Range<u64>> = vec![];
         let expected: Vec<Range<u64>> = vec![];
         assert_eq!(merge_ranges(ranges), expected);
+    }
+
+
+
+    use crate::encoder::{VCDEncoder, EncInst,WindowHeader};
+    use crate::reader::{Header, WinIndicator, DeltaIndicator};
+
+    const HDR:Header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+    const WIN_HDR:WindowHeader = WindowHeader {
+        win_indicator: WinIndicator::VCD_SOURCE,
+        source_segment_size: Some(5),
+        source_segment_position: Some(0),
+        size_of_the_target_window: 10,
+        delta_indicator: DeltaIndicator(0),
+    };
+    fn make_translator(patch_bytes:Vec<u8>)->VCDTranslator<Cursor<Vec<u8>>>{
+        VCDTranslator::new(VCDDecoder::new(VCDReader::new(Cursor::new(patch_bytes)).unwrap())).unwrap()
+    }
+    fn seq_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 14, u_pos: 1 })).unwrap();
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    fn copy_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    fn add_run_patch() -> VCDTranslator<Cursor<Vec<u8>>> {
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::RUN(RUN { len: 3, byte: b'X' })).unwrap();
+        encoder.next_inst(EncInst::ADD("YZ".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 1 })).unwrap();
+
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    #[test]
+    fn test_seq_patch(){
+        let mut translator = seq_patch();
+        for i in 0..10 {
+            let msg = translator.interrogate(i).unwrap().unwrap();
+            dbg!(&msg);
+        }
+    }
+    #[test]
+    fn test_copy_patch(){
+        let mut translator = copy_patch();
+        for i in 0..10 {
+            let msg = translator.interrogate(i).unwrap().unwrap();
+            dbg!(&msg);
+        }
     }
 }

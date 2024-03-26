@@ -1,3 +1,4 @@
+use core::panic;
 use std::{fmt::Debug, io::{Read, Seek,Write}, ops::Range};
 
 use crate::{encoder::{EncInst, VCDEncoder, WindowHeader}, reader::{Header, WinIndicator}, translator::{DisCopy, Inst, Sequence, SparseInst, VCDTranslator}, ADD, COPY, RUN};
@@ -31,62 +32,91 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
             cur_inst:None,
         })
     }
+    fn incr_crsr(&mut self,amt:u64){
+        dbg!(amt,self.crsr_o_pos);
+        self.crsr_o_pos += amt;
+    }
+    fn incr_o_pos(&mut self,amt:u64){
+        self.cur_o_pos += amt;
+    }
     pub fn merge_patches(mut self) -> std::io::Result<W> {
         // Main loop: Iterate through positions until all patches are applied
-        while let Some(instruction) = self.find_cntl_inst_for_position(self.crsr_o_pos)? {
-            dbg!(&instruction,self.cur_o_pos,self.crsr_o_pos,&self.cur_inst);
-            match (instruction,&self.cur_inst){
-                (Ok(inst), None) => {
-                    //we are at the top level loop, inst is root (Ok(_))
-                    self.crsr_o_pos = self.cur_o_pos + inst.inst.len() as u64;
-                    self.apply_instruction(inst)?;
-                },
-                (Ok(inst), Some(_)) => {
-                    //we are in a copy resolve, but found a direct add/run
-                    self.end_copy_resolution(inst)?;
-                },
-                (Err(copy), None) => {
-                    //top level loop and found a copy
-                    self.set_cur_inst(copy);
-                },
-                (Err(copy), Some(_)) => {
-                    //in copy resolve, and encountered a copy
-                    //it might be the same copy from last loop, or a copy from a sequence from last loop
-                    //it doesn't matter, we need to decide what to do with our state machine.
-                    //this should either: call end_copy, OR inc o_pos and stay in resolve mode
-                    self.continue_copy_resolution(copy)?;
-                },
-            }
-            // Write out and reset the current window if necessary
-            if self.current_window_size() >= self.max_u_size {
-                self.flush_window()?;
-            }
-            assert!(
-                self.cur_inst.is_none() && self.crsr_o_pos == self.cur_o_pos
-                ||
-                self.cur_inst.is_some() && self.crsr_o_pos != self.cur_o_pos,
-                "Invalid state: cur_inst: {:?}, crsr_o_pos: {}, cur_o_pos: {}",
-                self.cur_inst, self.crsr_o_pos, self.cur_o_pos
-            )
+        while let Some(instruction) = self.find_cntl_inst_for_position()? {
+            dbg!(&instruction,self.crsr_o_pos,&self.cur_inst);
+            self.merge_inner(instruction)?;
+        }
+        if self.cur_inst.is_some(){
+            self.apply_cur_inst()?;
         }
 
         // Final flush to write out any remaining instructions in the current window
         self.flush_window()?;
         Ok(self.sink.finish()?)
     }
+    fn merge_inner(&mut self,instruction: Result<ControlInst,CopyRootResolve>)->std::io::Result<()>{
+        match (instruction,&self.cur_inst){
+            (Ok(inst), None) => {
+                //we are at the top level loop, inst is root (Ok(_))
+                self.crsr_o_pos = self.cur_o_pos + inst.inst.len() as u64;
+                self.apply_instruction(inst)?;
+            },
+            (Ok(inst), Some(_)) => {
+                //we are in a copy resolve, but found a direct add/run
+                self.end_copy_resolution(inst)?;
+            },
+            (Err(copy), None) => {
+                //top level loop and found a copy
+                let len = copy.inst.len();
+                self.set_cur_inst(copy);
+                if len == 1 {
+                    self.apply_cur_inst()?;
+                }
+            },
+            (Err(copy), Some(_)) => {
+                //in copy resolve, and encountered a copy
+                //it might be the same copy from last loop, or a copy from a sequence from last loop
+                //it doesn't matter, we need to decide what to do with our state machine.
+                //this should either: call end_copy, OR inc o_pos and stay in resolve mode
+                self.continue_copy_resolution(copy)?;
+            },
+        }
+        // Write out and reset the current window if necessary
+        if self.current_window_size() >= self.max_u_size {
+            self.flush_window()?;
+        }
+        assert!(
+            self.cur_inst.is_none() && self.crsr_o_pos == self.cur_o_pos
+            ||
+            self.cur_inst.is_some() && self.crsr_o_pos != self.cur_o_pos,
+            "Invalid state: cur_inst: {:?}, crsr_o_pos: {}, cur_o_pos: {}",
+            self.cur_inst, self.crsr_o_pos, self.cur_o_pos
+        );
+        Ok(())
+    }
     fn continue_copy_resolution(&mut self,next_inst:CopyRootResolve)->std::io::Result<()>{
         //we are in a copy resolve, and encountered a copy-like control inst
         //we call start copy resolution to get the root inst for this inst
-        let CopyRootResolve { inst, patch_index } = next_inst;
         //we then interrogate our next position in our cur_inst
+        dbg!(&self.cur_inst);
         let cur_inst = self.cur_inst.as_mut().expect("cur_inst should be set here");
-        let cur_next_inst = cur_inst.inst.compare_form(cur_inst.cur_check_len).expect("cur_inst should not be used up yet");
+        let cur_cmp_inst = cur_inst.inst.compare_form(cur_inst.cur_check_len).expect("cur_inst should not be used up yet");
         //if these don't yield exactly identical inst, then we end the copy resolution
-        if inst != cur_next_inst{
-            return self.end_copy_resolution(ControlInst{inst, patch_index,output_start_pos:self.crsr_o_pos});
+        let next_cmp_inst = next_inst.inst.compare_form(0).expect("inst should not be zero length here");
+        //dbg!("cont_res",cur_cmp_inst,next_cmp_inst);
+        if next_cmp_inst != cur_cmp_inst{
+            self.apply_cur_inst()?;
+            return self.merge_inner(Err(next_inst));
         }else{
             //if they are the same, we increment our cur_inst and crsr_o_pos
-            self.increment_cur_inst();
+            //we discard next_inst since it is the same as our cur_inst for this byte.
+            cur_inst.cur_check_len += 1;
+            let inst_done = cur_inst.inst.len() as u32 == cur_inst.cur_check_len;
+            self.incr_crsr(1);
+            if inst_done{
+                //if we are at the end of our cur_inst, we apply it
+                self.apply_cur_inst()?;
+            }
+
         }
         Ok(())
     }
@@ -97,45 +127,44 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         let mut latest_copy = None;
         self.copy_buffer.reverse();
         //now in same order as the patches, last is latest.
+        //dbg!(&self.copy_buffer);
         while let Some(last_patch_inst) = self.copy_buffer.pop(){
             let InitialCopyInst{ inst, patch_index,..} = last_patch_inst;
             //first we interrogate position 0
             //if it is not a copy, we are done
             //if it is store it in cur_inst
             let inter_value = inst.interrogate(0).expect("inst should not be zero length here");
+            //dbg!(&inst,inter_value);
             let value = CopyRootResolve{inst:inter_value,patch_index};
             match inter_value{
                 RootInst::Add(_) | RootInst::Run(_) => {
+                    dbg!("start_copy_resolution->Add/Run",&latest_copy);
                     return value; //early return, we are done here
                 },
                 _ => {
                     if latest_copy.is_none(){
-                        latest_copy = Some(value); //incase all are copy, we store the inst from the last patch
+                        latest_copy = Some(value);//we want the latest inst
                     }
                 }
             }
         }
         //if we are here, then no add/run controls this byte in any patch
         //cur_inst will store the Copy from the last patch
+        //dbg!("start_copy_resolution->Copy",&latest_copy);
         return latest_copy.expect("Should have a copy inst here");
 
     }
     fn set_cur_inst(&mut self,inst:CopyRootResolve){
         let CopyRootResolve { inst, patch_index } = inst;
         self.cur_inst = Some(ResolveCopy{cur_check_len:1,inst,patch_index});
-        self.crsr_o_pos += 1; // Increment to the next byte
-    }
-    fn increment_cur_inst(&mut self){
-        let inst = self.cur_inst.as_mut().expect("cur_inst should be set here");
-        inst.cur_check_len += 1;
-        self.crsr_o_pos += 1;
+        self.incr_crsr(1);
     }
     fn apply_cur_inst(&mut self)->std::io::Result<()>{
         //take our cur_inst, truncate it per the o_start of this root inst
         let ResolveCopy{mut inst, cur_check_len, patch_index} = self.cur_inst.take().expect("cur_inst should be set here");
         let trunc = inst.len() as u32 - cur_check_len;
         inst.trunc(trunc as u32);   // Truncate per the position of the root inst
-        //self.crsr_o_pos += inst.len() as u64; //we already advanced this inst?
+        //self.incr_crsr(1);
         debug_assert_eq!(self.crsr_o_pos, self.cur_o_pos + inst.len() as u64, "crsr_o_pos: {} cur_o_pos: {}", self.crsr_o_pos, self.cur_o_pos);
         self.apply_instruction(ControlInst{inst, patch_index,output_start_pos:self.cur_o_pos})
     }
@@ -144,8 +173,10 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         //THEN apply the cur_inst (to ensure flushing works crsr == o_pos)
         //make crsr == to root_inst + cur_inst_len
         //THEN apply the root inst
+        dbg!("end_copy_resolution");
         self.apply_cur_inst()?;
-        self.crsr_o_pos += instruction.inst.len() as u64;
+        self.incr_crsr(instruction.inst.len() as u64);
+
         debug_assert_eq!(self.crsr_o_pos, self.cur_o_pos + instruction.inst.len() as u64, "crsr_o_pos: {} cur_o_pos: {}", self.crsr_o_pos, self.cur_o_pos);
         self.apply_instruction(instruction)
     }
@@ -199,10 +230,9 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
     fn add_to_window(&mut self,inst:ControlInst){
         let ControlInst { output_start_pos, inst, patch_index } = inst;
         debug_assert!(output_start_pos == self.cur_o_pos, "inst output start pos: {} cur_o_pos: {}", output_start_pos, self.cur_o_pos);
-        self.cur_o_pos += inst.len() as u64;
         //adjust our current window
         let (src_range,trgt_win_size) = self.new_win_sizes(&inst);
-        dbg!(inst,src_range,trgt_win_size);
+        //dbg!("add_to_window",inst,output_start_pos);
         let ws = self.win_sum.get_or_insert(Default::default());
         if let Some((ssp,sss)) = src_range {
             ws.source_segment_position = Some(ssp);
@@ -212,6 +242,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
             }
         }
         ws.size_of_the_target_window = trgt_win_size;
+        self.cur_o_pos += inst.len() as u64;
 
         self.cur_win.push(MergedInst{inst,patch_index});
     }
@@ -250,6 +281,7 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
         // Write out the current window
         let ws = self.win_sum.take().expect("win_sum should be set here");
         let output_ssp = ws.source_segment_position.clone();
+        dbg!(&ws);
         self.sink.start_new_win(ws)?;
         for MergedInst { inst, patch_index } in self.cur_win.drain(..) {
             match inst {
@@ -262,13 +294,22 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
                 RootInst::Run(r) => {
                     self.sink.next_inst(EncInst::RUN(r)).unwrap();
                 },
-                RootInst::Copy(DisCopy { copy:COPY { len, u_pos }, ssp,.. }) => {
+                RootInst::Copy(DisCopy { copy:COPY { len, u_pos }, ssp,sss }) => {
                     //we need to translate this so our u_pos is correct
                     let output_ssp = output_ssp.expect("output_ssp should be set here");
                     //our ssp is within (or coincident) to the bounds of the source segment
                     let zero_u_pos = u_pos as u64 + ssp;
-                    let shift = zero_u_pos - output_ssp; //lower bound should be 0;
-                    self.sink.next_inst(EncInst::COPY(COPY { len, u_pos: u_pos + shift as u32})).unwrap();
+                    let copy_inst = if output_ssp > ssp{
+                        let neg_shift = output_ssp - ssp;
+                        COPY { len, u_pos: u_pos - neg_shift as u32 }
+                    }else{
+                        let pos_shift = ssp - output_ssp;
+                        COPY { len, u_pos: u_pos + pos_shift as u32 }
+                    };
+                    // let shift = zero_u_pos - output_ssp; //lower bound should be 0;
+                    // let copy_inst = COPY { len, u_pos: u_pos - shift as u32 };
+                    dbg!(copy_inst,zero_u_pos,output_ssp,ssp,sss);
+                    self.sink.next_inst(EncInst::COPY(copy_inst)).unwrap();
                 },
             }
         }
@@ -276,12 +317,15 @@ impl<R: Read + Seek, W:Write> VCDMerger<R,W> {
     }
 
     /// Finds the effective instruction for a given position in the output stream, with precedence rules.
-    fn find_cntl_inst_for_position(&mut self, o_position: u64) -> std::io::Result<Option<Result<ControlInst,CopyRootResolve>>> {
+    fn find_cntl_inst_for_position(&mut self) -> std::io::Result<Option<Result<ControlInst,CopyRootResolve>>> {
         self.copy_buffer.clear();
+        let o_position = self.crsr_o_pos;
+        dbg!(self.crsr_o_pos);
 
         // Iterate through the patches in reverse order, as the most recent patch has the highest precedence.
         for (i,translator) in self.sequential_patches.iter_mut().enumerate().rev() {
             if let Some(SparseInst { o_start, mut inst }) = translator.interrogate(o_position)? {
+                //dbg!(o_position,o_start,&inst,i);
                 inst.skip((o_position - o_start) as u32);
                 if inst.is_copy(){
                     self.copy_buffer.push(InitialCopyInst {inst:inst.to_copy(), patch_index: i});
@@ -330,40 +374,49 @@ impl Sequence{
         let mut seq_pos = 0;
         loop{
             for inst in self.inst.iter(){
-                let inst_seq_start = seq_pos;
                 let len = inst.len();
+                let inst_seq_start = seq_pos;
                 let seq_end_pos = seq_pos + len;
-                let offset_start = offset;
-                let offset_end = offset + len;
-                if offset >= self.len(){
+                seq_pos += len; //our seq_pos always moves the whole len of the inst
+                if seq_end_pos <= self.skip{
+                    continue; //we are before the skip
+                }else if offset >= self.len(){
                     return None;
                 }
-                if seq_end_pos > self.skip && (offset_start..offset_end).contains(&(seq_offset as u32)){
+                //if we are here we are in the right range
+                let skip_amt = if inst_seq_start < self.skip && seq_end_pos > self.skip{
+                    self.skip -inst_seq_start
+                }else{//we are adjusting for the skip here
+                    0
+                };
+
+                let adj_len = len - skip_amt;
+                let offset_start = offset;
+                let offset_end = offset + adj_len;
+
+                //dbg!(&self,skip_amt,adj_len,inst_seq_start,seq_offset,offset_start,offset_end);
+                let inst_cntl_range = offset_start..offset_end;
+                if inst_cntl_range.contains(&(seq_offset as u32)){
                     let output = inst.clone();
-                    let skip = seq_offset as u32 - offset_start;
                     match output{
                         Inst::Sequence(seq) => {
                             //recursively resolve
-                            return seq.interrogate(skip as usize);
+                            return seq.interrogate(skip_amt as usize);
                         },
                         mut a => {
-                            a.skip(skip);
+                            a.skip(skip_amt);
                             return Some(a.to_root())
                         },
                     }
                 }
-                seq_pos += len;
-                if inst_seq_start > self.skip{
-                    offset += len;
-                }else if seq_end_pos > self.skip{
-                    offset += seq_end_pos - self.skip;
-                }//else we are before the skip
+                offset += adj_len;
             }
         }
     }
 }
 
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CopyInst{
     Copy(DisCopy),
     Seq(Sequence)
@@ -427,7 +480,7 @@ impl RootInst {
                 copy.copy.skip(offset);
                 let Range{start,end} = copy.min_src();
                 copy.ssp = start;
-                copy.sss = start + end;
+                copy.sss = end-start;
             },
             RootInst::Add(add) => add.skip(offset),
             RootInst::Run(run) => run.skip(offset),
@@ -519,10 +572,12 @@ struct ControlInst{
     patch_index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct InitialCopyInst{
     inst: CopyInst,
     patch_index: usize,
 }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct MergedInst{
     inst: RootInst,
     patch_index: usize,
@@ -582,16 +637,21 @@ mod test_super {
     Add/Run precedence
 
     For the seq:
-    We will simply make a patch that will take the last four bytes and sequence them to len 10.
-    This should turn '01234' into '1234123412'
+    We will simply Copy the first byte and then last four bytes and sequence them to len 10.
+    This should turn '01234' into '0123412341'
 
     For the copy:
     We will make a patch that will copy the first five bytes to the last five bytes.
     This should turn '01234' into '0123401234'
 
     For the add/run:
-    We will make a patch that will insert 'XXX'(Run) + 'YZ'(Add) after the first char
-    This should turn '01234' into '0XXXYZ1234'
+    We will make a patch that will insert 'A' (ADD) at first pos Copy next 2, Then 'XXX'(Run) + 'YZ'(Add) The COpy rem
+    This should turn '01234' into 'A12XXXYZ34'
+
+    Then we do a patch with multiple transforms internally
+    Complex:
+    We will Add 'Y' Run(2) 'Z' CopySeq last in S u_pos 4 len 6 (len in t=3) Copy u_pos 1 len 4
+    This should turn '01234' into 'YZZ4YZ1234'
 
     We can then mix and match these patches and we should be able to reason about the outputs.
     */
@@ -611,6 +671,7 @@ mod test_super {
         let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
         encoder.next_inst(EncInst::COPY(COPY { len: 14, u_pos: 1 })).unwrap();
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
@@ -630,11 +691,24 @@ mod test_super {
         let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::ADD("A".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 1 })).unwrap();
         encoder.next_inst(EncInst::RUN(RUN { len: 3, byte: b'X' })).unwrap();
         encoder.next_inst(EncInst::ADD("YZ".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 1 })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 3 })).unwrap();
 
+        // Force encoding
+        let w = encoder.finish().unwrap().into_inner();
+        make_translator(w)
+    }
+    fn complex_patch()->VCDTranslator<Cursor<Vec<u8>>>{
+        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WIN_HDR).unwrap();
+        // Instructions
+        encoder.next_inst(EncInst::ADD("Y".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::RUN(RUN { len: 2, byte: b'Z' })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 3, u_pos: 4 })).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 1 })).unwrap();
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
         make_translator(w)
@@ -642,7 +716,8 @@ mod test_super {
     const SRC:&[u8] = b"01234";
     #[test]
     fn test_copy_seq(){
-        let answer = b"0234123412";
+        //01234 Copy-> 0123401234 Seq-> 0123412341
+        let answer = b"0123412341";
         let copy = copy_patch();
         let seq = seq_patch();
         let merger = VCDMerger::new(vec![copy,seq],Vec::new(),None).unwrap();
@@ -656,8 +731,25 @@ mod test_super {
         assert_eq!(output,answer);
     }
     #[test]
+    fn test_seq_copy(){
+        //01234 Seq-> 0123412341 Seq-> 0123401234
+        let answer = b"0123401234";
+        let copy = copy_patch();
+        let seq = seq_patch();
+        let merger = VCDMerger::new(vec![seq,copy],Vec::new(),None).unwrap();
+        let merged_patch = merger.merge_patches().unwrap();
+        let mut cursor = Cursor::new(merged_patch);
+        let mut output = Vec::new();
+        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        //print output as a string
+        let as_str = std::str::from_utf8(&output).unwrap();
+        println!("{}",as_str);
+        assert_eq!(output,answer);
+    }
+    #[test]
     fn test_seq_copy_add(){
-        let answer = b"0XXXYZ1234";
+        //01234 Seq->Copy 0123412341 Add-> A12XXXYZ34
+        let answer = b"A12XXXYZ34";
         let seq = seq_patch();
         let copy = copy_patch();
         let add_run = add_run_patch();
@@ -673,11 +765,28 @@ mod test_super {
     }
     #[test]
     fn test_copy_seq_add(){
-        let answer = b"1XXXYZ3412";
+        //01234 Copy->Seq 0123412341 Add-> A12XXXYZ34
+        let answer = b"A12XXXYZ34";
         let seq = seq_patch();
         let copy = copy_patch();
         let add_run = add_run_patch();
         let merger = VCDMerger::new(vec![copy,seq,add_run],Vec::new(),None).unwrap();
+        let merged_patch = merger.merge_patches().unwrap();
+        let mut cursor = Cursor::new(merged_patch);
+        let mut output = Vec::new();
+        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        //print output as a string
+        let as_str = std::str::from_utf8(&output).unwrap();
+        println!("{}",as_str);
+        assert_eq!(output,answer);
+    }
+    #[test]
+    fn test_add_complex(){
+        //01234 Add-> A12XXXYZ34 Compl YZZXYZ12XX
+        let answer = b"YZZXYZ12XX";
+        let add_run = add_run_patch();
+        let comp = complex_patch();
+        let merger = VCDMerger::new(vec![add_run,comp],Vec::new(),None).unwrap();
         let merged_patch = merger.merge_patches().unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
