@@ -42,6 +42,9 @@ impl<R: Read + Seek> VCDReader<R> {
             moved: false,
         })
     }
+    pub fn into_inner(self)->R{
+        self.source
+    }
     pub fn read_from_src(&mut self,from_start:u64, buf:&mut [u8])->io::Result<()>{
         self.source.seek(io::SeekFrom::Start(from_start))?;
         self.moved = true;
@@ -353,7 +356,7 @@ impl WinIndicator {
 
 #[repr(transparent)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DeltaIndicator(u8);
+pub struct DeltaIndicator(pub u8);
 
 impl DeltaIndicator {
     pub fn from_u8(byte: u8) -> Self {

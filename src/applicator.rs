@@ -2,10 +2,10 @@ use std::{fmt::Debug, io::{Read,Seek,Write}, ops::{Bound, Range, RangeBounds}};
 
 use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
 
-pub fn apply_patch<R:Read+Seek+Debug,W:Write>(mut patch:R,mut src:Option<R>,mut sink:W) -> std::io::Result<()> {
+pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sink:&mut W) -> std::io::Result<()> {
     //to avoid the Read+Seek bound on sink,
     //we need to scan the whole patch file so we can cache the TargetSourced windows
-    let windows = gather_summaries(&mut patch)?;
+    let windows = gather_summaries(patch)?;
     let dependencies = find_dep_ranges(&windows);
     let reader = VCDReader::new(patch)?;
     let mut decoder = VCDDecoder::new(reader);
@@ -352,9 +352,9 @@ mod tests {
             0,
             4,
         ];
-        let patch = Cursor::new(patch);
+        let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello!".as_bytes());
     }
     #[test]
@@ -401,9 +401,9 @@ mod tests {
             118, //COPY6_mode6 NOOP
             0, //addr 0
         ];
-        let patch = Cursor::new(patch);
+        let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello!".as_bytes());
     }
 
@@ -467,9 +467,9 @@ mod tests {
             0, //addr 0
             1, //addr 1
         ];
-        let patch = Cursor::new(patch);
+        let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello! Hell...".as_bytes());
 
     }
