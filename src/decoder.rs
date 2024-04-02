@@ -61,13 +61,8 @@ pub struct VCDDecoder<R> {
     addr_pos: u64,
     ///Where we are in the data section
     data_pos: u64,
-    cur_window: usize,
     ///Are we currently in a window?
     in_window: bool,
-    ///This is global in the target output
-    ///That is, it cuts across window boundaries
-    ///This increments after we read any single DecodedInstruction
-    cur_o_position: u64,
     ///This is our position in string U, it starts at SourceSegmentSize and increments as we read instructions
     ///Giving us our current position in U
     cur_u_position: u64,
@@ -79,23 +74,15 @@ impl<R: Read + Seek> VCDDecoder<R> {
             reader,
             addr_pos: 0,
             data_pos: 0,
-            cur_window: 0,
             in_window: false,
-            cur_o_position: 0,
             cur_u_position: 0,
         }
     }
     pub fn reader(&mut self) -> &mut VCDReader<R> {
         &mut self.reader
     }
-    pub fn position(&self) -> u64 {
-        self.cur_o_position
-    }
     pub fn u_position(&self) -> u64 {
         self.cur_u_position
-    }
-    pub fn cur_win_index(&self) -> usize {
-        self.cur_window
     }
     fn handle_inst(&mut self, inst: TableInst) -> std::io::Result<Option<DecInst>> {
         Ok(match inst{
@@ -105,7 +92,6 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 let mut byte = [0u8];
                 self.reader.read_from_src(self.data_pos, &mut byte)?;
                 self.data_pos += 1;
-                self.cur_o_position += len;
                 self.cur_u_position += len;
 
                 let inst = DecInst::Run(RUN { len: len as u32, byte: byte[0] });
@@ -117,7 +103,6 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 }else{size as u64};
                 let pos = self.data_pos;
                 self.data_pos += len;
-                self.cur_o_position += len;
                 self.cur_u_position += len;
 
                 let inst = DecInst::Add(ADD { len: len as u32, p_pos: pos });
@@ -132,7 +117,6 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 let inst = DecInst::Copy(COPY { len: len as u32, u_pos: addr as u32 });
                 self.addr_pos += read as u64;
                 let len_t = inst.len_in_t(self.cur_u_position as usize) as u64;
-                self.cur_o_position += len_t;
                 self.cur_u_position += len_t;
 
                 Some(inst)
@@ -140,22 +124,30 @@ impl<R: Read + Seek> VCDDecoder<R> {
             TableInst::NoOp => None,
         })
     }
+    pub fn seek_to_window(&mut self, ws:&WindowSummary){
+        self.reader.seek_to_window(ws.win_start_pos);
+        self.in_window = false; //we will re-read the window summary on next call
+        // self.set_new_window_state(ws);
+    }
+    fn set_new_window_state(&mut self, ws:&WindowSummary){
+        self.in_window = true;
+        self.addr_pos = ws.addr_sec_start();
+        self.data_pos = ws.data_sec_start();
+        self.cur_u_position = ws.source_segment_size.unwrap_or(0);
+        self.caches = Cache::new();
+    }
     pub fn next(&mut self) -> std::io::Result<VCDiffDecodeMsg> {
         match self.reader.next()?{
             VCDiffReadMsg::WindowSummary(ws) => {
                 assert!(!self.in_window, "We got a window summary while we are still in a window");
                 assert_eq!(ws.delta_indicator.to_u8(), 0, "Secondary Compression is not currently supported");
-                self.in_window = true;
-                self.cur_window += 1;
-                self.addr_pos = ws.addr_sec_start();
-                self.data_pos = ws.data_sec_start();
-                self.cur_u_position = ws.source_segment_size.unwrap_or(0);
+                self.set_new_window_state(&ws);
                 Ok(VCDiffDecodeMsg::WindowSummary(ws))
             },
             VCDiffReadMsg::InstSecByte(code) => {
                 //this is the only message that can advance our position
                 if self.in_window{
-                    let o_start = self.cur_o_position;
+                    let u_start = self.cur_u_position;
                     let CodeTableEntry{ first, second } = VCD_C_TABLE[code as usize];
                     let f = if let Some(inst) = self.handle_inst(first)? {
                         inst
@@ -164,7 +156,7 @@ impl<R: Read + Seek> VCDDecoder<R> {
                     };
                     let s = self.handle_inst(second)?;
 
-                    Ok(VCDiffDecodeMsg::Inst{o_start,first: f, second: s})
+                    Ok(VCDiffDecodeMsg::Inst{u_start,first: f, second: s})
                 }else{
                     panic!("We got an opcode without a window summary");
                 }
@@ -186,7 +178,7 @@ impl<R: Read + Seek> VCDDecoder<R> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VCDiffDecodeMsg{
     WindowSummary(WindowSummary),
-    Inst{o_start:u64, first: DecInst, second: Option<DecInst>},
+    Inst{u_start:u64, first: DecInst, second: Option<DecInst>},
     EndOfWindow,
     EndOfFile,
 }
@@ -216,8 +208,8 @@ mod test_super {
                 win_start_pos: 5,
                 win_indicator: WinIndicator::VCD_SOURCE,
             }),
-            VCDiffDecodeMsg::Inst{o_start: 0, first: DecInst::Add(ADD{len: 1, p_pos: 14}), second: Some(DecInst::Copy(COPY { len:4, u_pos:1 }))},
-            VCDiffDecodeMsg::Inst{o_start: 5, first: DecInst::Add(ADD{len: 2, p_pos: 15}), second: Some(DecInst::Copy(COPY { len:6, u_pos:4 }))},
+            VCDiffDecodeMsg::Inst{u_start: 4, first: DecInst::Add(ADD{len: 1, p_pos: 14}), second: Some(DecInst::Copy(COPY { len:4, u_pos:1 }))},
+            VCDiffDecodeMsg::Inst{u_start: 9, first: DecInst::Add(ADD{len: 2, p_pos: 15}), second: Some(DecInst::Copy(COPY { len:6, u_pos:4 }))},
             VCDiffDecodeMsg::EndOfWindow,
             VCDiffDecodeMsg::EndOfFile,
         ];
@@ -281,8 +273,8 @@ mod test_super {
                 win_start_pos: 5,
                 win_indicator: WinIndicator::Neither,
             }),
-            VCDiffDecodeMsg::Inst{o_start: 0, first: DecInst::Add(ADD{len: 3, p_pos: 12}), second: Some(DecInst::Copy(COPY { len:5, u_pos:1 }))},
-            VCDiffDecodeMsg::Inst{o_start: 6, first: DecInst::Add(ADD{len: 2, p_pos: 15}), second: None},
+            VCDiffDecodeMsg::Inst{u_start: 0, first: DecInst::Add(ADD{len: 3, p_pos: 12}), second: Some(DecInst::Copy(COPY { len:5, u_pos:1 }))},
+            VCDiffDecodeMsg::Inst{u_start: 6, first: DecInst::Add(ADD{len: 2, p_pos: 15}), second: None},
             VCDiffDecodeMsg::EndOfWindow,
             VCDiffDecodeMsg::EndOfFile,
         ];

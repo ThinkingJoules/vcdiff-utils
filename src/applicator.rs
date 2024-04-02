@@ -474,6 +474,58 @@ mod tests {
 
     }
 
+#[test]
+    fn test_kitchen_sink2(){
+        // "hello world!" -> "Hello! Hello! Hello. "
+        let src = Cursor::new("hello world!".as_bytes().to_vec());
+
+        //from encoder tests
+        let patch = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            1, //win_indicator Src
+            11, //SSS
+            1, //SSP
+            14, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            5, //length of instructions and size
+            3, //length of addr
+            72, //data section 'H'
+            235, //ADD1 COPY4_mode6
+            35, //COPY0_mode1
+            1, //..size
+            19, //COPY0_mode0
+            1, //..size
+            0, //addr 0
+            6, //addr 1
+            4, //addr 2
+            2, //win_indicator VCD_TARGET
+            7, //SSS
+            0, //SSP
+            13, //delta window size
+            14, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            5, //length of instructions and size
+            2, //length of addr
+            46, //data section '.'
+            115, //COPY0_mode6 noop
+            19, //..size
+            2, //Add1 NOOP
+            35, //COPY0_mode1
+            1, //..size
+            0, //addr 0
+            7, //addr 1
+        ];
+        let mut patch = Cursor::new(patch);
+        let mut sink = Vec::new();
+        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
+        let str = std::str::from_utf8(&sink).unwrap();
+        assert_eq!(str, "Hello! Hello! Hello. ");
+
+    }
     #[test]
     fn test_add_and_retrieve() {
         let mut cache = SparseCache::new();

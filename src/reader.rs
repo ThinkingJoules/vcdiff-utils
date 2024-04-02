@@ -45,6 +45,11 @@ impl<R: Read + Seek> VCDReader<R> {
     pub fn into_inner(self)->R{
         self.source
     }
+    pub fn seek_to_window(&mut self,win_start_pos:u64){
+        self.cur_pos = win_start_pos;
+        self.cur_state = VCDiffState::EoW;
+        self.moved = true; //let the next call seek
+    }
     pub fn read_from_src(&mut self,from_start:u64, buf:&mut [u8])->io::Result<()>{
         self.source.seek(io::SeekFrom::Start(from_start))?;
         self.moved = true;

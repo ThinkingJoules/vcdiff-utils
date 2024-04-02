@@ -178,6 +178,7 @@ impl<W: Write> VCDEncoder<W> {
     pub fn start_new_win(&mut self,win_hdr:WindowHeader)-> std::io::Result<()> {
         self.flush()?;
         self.cur_win = Some(win_hdr);
+        self.caches = Cache::new();
         Ok(())
     }
     pub fn finish(mut self) -> std::io::Result<W> {
@@ -800,6 +801,69 @@ mod test_super {
             3, //...size
             0, //addr 0
             1, //addr 1
+        ];
+
+        assert_eq!(w, answer);
+
+
+
+    }
+    #[test]
+    pub fn kitchen_sink_transform2(){
+
+        let mock_sink = Cursor::new(Vec::new());
+        let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
+        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(11), source_segment_position: Some(1), size_of_the_target_window:7 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(EncInst::ADD("H".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 0 })).unwrap(); //ello
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 10 })).unwrap(); //'!'
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 4 })).unwrap(); //' '
+        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(7), source_segment_position: Some(0), size_of_the_target_window:14 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 19, u_pos: 0 })).unwrap(); //Hello! Hello! Hello
+        encoder.next_inst(EncInst::ADD(".".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 13 })).unwrap(); // ' '
+
+        let w = encoder.finish().unwrap().into_inner();
+        //dbg!(&w);
+        let answer = vec![
+            214,195,196,0, //magic
+            0, //hdr_indicator
+            1, //win_indicator Src
+            11, //SSS
+            1, //SSP
+            14, //delta window size
+            7, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            5, //length of instructions and size
+            3, //length of addr
+            72, //data section 'H'
+            235, //ADD1 COPY4_mode6
+            35, //COPY0_mode1
+            1, //..size
+            19, //COPY0_mode0
+            1, //..size
+            0, //addr 0
+            6, //addr 1
+            4, //addr 2
+            2, //win_indicator VCD_TARGET
+            7, //SSS
+            0, //SSP
+            13, //delta window size
+            14, //target window size
+            0, //delta indicator
+            1, //length of data for ADDs and RUN/
+            5, //length of instructions and size
+            2, //length of addr
+            46, //data section '.'
+            115, //COPY0_mode6 noop
+            19, //..size
+            2, //Add1 NOOP
+            35, //COPY0_mode1
+            1, //..size
+            0, //addr 0
+            7, //addr 1
         ];
 
         assert_eq!(w, answer);
