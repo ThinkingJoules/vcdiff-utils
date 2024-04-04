@@ -1,6 +1,6 @@
 use std::{fmt::Debug, io::{Read,Seek,Write}, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
 #[derive(Debug,Default)]
 struct Stats{
     add: usize,
@@ -21,6 +21,21 @@ impl Stats{
     fn seq(&mut self){
         self.seq += 1;
     }
+}
+
+fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
+    let mut ranges = Vec::new();
+    for ws in summaries.iter().rev() {
+        if let WinIndicator::VCD_TARGET = ws.win_indicator {
+            let ssp = ws.source_segment_position.unwrap() as u64;
+            let sss = ws.source_segment_size.unwrap() as u64;
+            ranges.push(ssp..ssp+sss);
+        }
+    }
+    let mut ranges = merge_ranges(ranges);
+    //sort with the smallest last
+    ranges.sort_by(|a,b|b.start.cmp(&a.start));
+    ranges
 }
 
 pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sink:&mut W) -> std::io::Result<()> {

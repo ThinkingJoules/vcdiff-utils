@@ -24,9 +24,9 @@ lets call the first CopyTU, and the implicit sequence CopyTS.
 We need to understand when these various copy commands have precedence in 'later' vs 'earlier' patch files.
 
 Here are my first thoughts:
-TU or TS found in 'later' can be preserved as-is, since these are indirectly references to *other instructions*.
+TU/TS/SO found in 'later' can be preserved as-is, since these are indirectly references to *other instructions*.
     However, we cannot add any new TU/TS to 'later'.
-SS or SO found in 'later' need to be 'dereferenced' to instructions in 'earlier'.
+SS found in 'later' needs to be 'dereferenced' to instructions in 'earlier'.
     We need to replace the 'later' instructions with one or more instructions from 'earlier'.
     This requires us potentially modifying the controlling instructions so that the length matches the copy instruction found.
     This would require 'skipping' bytes on the first instruction, and potentially 'truncating' bytes off the last instruction.
@@ -38,8 +38,8 @@ SS or SO found in 'later' need to be 'dereferenced' to instructions in 'earlier'
 
 A TU in the earlier patch would be referencing commands earlier commands from *its* patch file.
 However, this can only happen if we are de-referencing a CopyS* from the 'later' patch.
-Since we are selectively merging instructions, moving a TU/TS to 'later' does not semantically follow.
-We need to de-reference any found T* in earlier to some S* (*depends on win type we found T in) in later.
+Since we are selectively merging instructions, moving a TU/TS/SO to 'later' does not semantically follow.
+We need to de-reference any non SS Copy so it can be merged semantically in later.
 */
 struct MergeState<R,W>{
     cur_o_pos: u64,

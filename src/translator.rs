@@ -1,6 +1,7 @@
+use core::panic;
 use std::{io::{Read, Seek}, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_header, read_window_header, WinIndicator, WindowSummary}, ADD, COPY, RUN};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_header, read_window_header, WindowSummary}, ADD, COPY, RUN};
 
 
 
@@ -15,41 +16,18 @@ pub fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec
     }
     Ok(summaries)
 }
-
-pub fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
-    let mut ranges = Vec::new();
-    for ws in summaries.iter().rev() {
-        if let WinIndicator::VCD_TARGET = ws.win_indicator {
-            let ssp = ws.source_segment_position.unwrap() as u64;
-            let sss = ws.source_segment_size.unwrap() as u64;
-            ranges.push(ssp..ssp+sss);
-        }
-    }
-    let mut ranges = merge_ranges(ranges);
-    //sort with the smallest last
-    ranges.sort_by(|a,b|b.start.cmp(&a.start));
-    ranges
-}
 /*
-When a handle encounters a TrgtSourcedWindow, it must resolve the source data from a SrcSourcedWindow.
-We scanned the file for all the summaries so we know which instructions to retain that will be ref'd later
-The merge handle can only return Src oriented instructions, since Trgt is synthetic because we are merging.
-When a handle is interrogated for a position, it must resolve the source data for the TrgtSourcedWindow
-This mean returning one or more instructions that represent the translation.
-These instructions will not exist anywhere, we need to adapt existing ones to match the Target Copy command.
-If the instruction is in a source (or null) window we will only ever return a single instruction.
-COPYs will be the most mutilated during merging, as ADD/RUNs take precedence.
-COPYs might be merged if there are no ADD/RUNs in any of the patches for a run of bytes.?????
-NO. A COPY in the latest patch only ends because of a ADD/RUN, so we cannot merge them.
-So it will never get larger, only smaller if older patches have ADD/RUNs that overlap.
-I think that is right.
+The translator must process the file sequentially to find any implicit sequences.
+We store all instructions so that we can resolve Copys in T or TargetSourcedWindows (or both).
+An Copy or sequence found in a Sparse instruction is already normalized and can be merged.
+In theory, we only translate the 'earlier' patch file.
+The 'later' patch, we are simply trying to 'fill in' COPYs with a src window reference.
+If it is in T, we just need to resolve copys in S.
 
-When we ask for a byte in MergeHandle, it will return a modified instruction that starts at that byte.
-If it is a TrgtSourcedWindow, it will return a Vec of instructions that represent the translation.
-The idea is that the caller will be working instruction by instruction, but also byte by byte.
-Only Copies will defer to earlier patches trying to find an ADD/RUN that covers the byte.
-So, it only works byte by byte when the last patch is a COPY. We need to find the last ADD/RUN that covers the byte.
-We will probably only ever end up truncating COPY commands. Not sure when a merge or lengthening would happen.
+The main goal would be to get this refactored to be more efficient.
+
+For starters, we need to more efficiently find our run of inst for a given slice
+Binary search in the vec might not be the fastest, maybe btree?
 */
 
 ///This orchestrates a single patch file. For Merging purposes.
@@ -109,19 +87,26 @@ impl<R:Read+Seek> VCDTranslator<R> {
         self.load_up_to(o_position + len as u64)?;
         Ok(self.retrieve_exact_slice_from_src_data(o_position, len).into_iter().map(|x|x.inst).collect())
     }
-    pub fn interrogate(&mut self, o_position: u64) -> std::io::Result<Option<SparseInst>> {
-        self.load_up_to(o_position)?;
+    fn controlling_inst_idx(&self,o_position: u64)->Option<usize>{
         let inst = self.src_data.binary_search_by(|probe|{
             let end = probe.o_start + probe.inst.len() as u64;
             if (probe.o_start..end).contains(&o_position){
                 return std::cmp::Ordering::Equal
-            }else if end <= o_position {
-                return std::cmp::Ordering::Less
-            }else{
+            }else if probe.o_start > o_position {
                 return std::cmp::Ordering::Greater
+            }else{
+                return std::cmp::Ordering::Less
             }
         });
         if let Ok(idx) = inst {
+            Some(idx)
+        }else {
+            None
+        }
+    }
+    pub fn interrogate(&mut self, o_position: u64) -> std::io::Result<Option<SparseInst>> {
+        self.load_up_to(o_position)?;
+        if let Some(idx) = self.controlling_inst_idx(o_position){
             return Ok(Some(self.src_data[idx].clone()));
         }else {
             return Ok(None)
@@ -325,31 +310,31 @@ impl<R:Read+Seek> VCDTranslator<R> {
     fn retrieve_exact_slice_from_src_data(&self,o_position: u64,len: u32)->Vec<SparseInst>{
         let mut last = 0;
         let mut slice = Vec::new();
-        let range = o_position..o_position + len as u64;
-        for SparseInst { o_start, inst } in self.src_data.iter() {
+        let end_pos = o_position + len as u64;
+        let start_inst_idx = self.controlling_inst_idx(o_position).unwrap();
+        for SparseInst { o_start, inst } in self.src_data[start_inst_idx..].iter() {
             let inst_len = inst.len();
             let cur_inst_end = o_start + inst_len as u64;
             debug_assert!(if !slice.is_empty(){last == *o_start}else{true});
+            let mut cur_inst = inst.clone();
 
-            if let Some(overlap) = range_overlap(&(*o_start..cur_inst_end), &range) {
-                let mut cur_inst = inst.clone();
-
-                if overlap.start > *o_start {
-                    let skip = overlap.start - *o_start;
-                    cur_inst.skip(skip as u32);
-                }
-                if overlap.end < cur_inst_end {
-                    let trunc = cur_inst_end - overlap.end;
-                    cur_inst.trunc(trunc as u32);
-                }
-                debug_assert!(cur_inst.len() > 0, "The instruction length is zero");
-                slice.push(SparseInst { o_start: *o_start, inst: cur_inst });
+            if o_position > *o_start {
+                let skip = o_position - *o_start;
+                cur_inst.skip(skip as u32);
             }
-            if cur_inst_end >= range.end {
+            if end_pos < cur_inst_end {
+                let trunc = cur_inst_end - end_pos;
+                cur_inst.trunc(trunc as u32);
+            }
+            debug_assert!(cur_inst.len() > 0, "The instruction length is zero");
+            slice.push(SparseInst { o_start: *o_start, inst: cur_inst });
+
+            last = cur_inst_end;
+            if cur_inst_end >= end_pos {
                 break;
             }
-            last = cur_inst_end;
         }
+        debug_assert!(last >= end_pos, "The last instruction end is before the requested end position");
         slice
     }
     // This handles cross-window translation using previously resolved instructions
@@ -618,28 +603,6 @@ impl ProcessInst {
             },
         }
     }
-    // fn len_in_t(&self, inst_u_start:u32) -> u32 {
-    //     match self {
-    //         Self::Add(inst) => {inst.len()},
-    //         Self::Run(inst) => {inst.len()},
-    //         Self::Copy { copy:COPY { len, u_pos }, .. } => {
-    //             let u_pos = *u_pos as u32;
-    //             let end = u_pos + *len;
-    //             dbg!(inst_u_start, u_pos, end, *len);
-    //             if end > inst_u_start {
-    //                 end - inst_u_start
-    //             }else{
-    //                 *len
-    //             }
-    //         },
-    //         Self::Sequence(ProcSequence { len, skip, trunc, ..}) => {
-    //             //cannot be zero len, we have a logical error somewhere
-    //             debug_assert!(skip + trunc < *len);
-    //             len - (skip + trunc)
-    //         },
-    //     }
-
-    // }
     fn skip(&mut self, amt: u32) {
         if amt == 0 {return}
         match self {
