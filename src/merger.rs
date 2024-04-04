@@ -3,6 +3,44 @@ use std::{fmt::Debug, io::{Read, Seek,Write}, ops::Range};
 
 use crate::{encoder::{EncInst, VCDEncoder, WindowHeader}, reader::{Header, WinIndicator}, translator::{DisCopy, Inst, Sequence, SparseInst, VCDTranslator}, ADD, COPY, RUN};
 
+/*
+In theory we only ever need to compare two patch files at once.
+We have an 'earlier' and a 'later' patch.
+We need to figure out the precedence rules for merging.
+
+Any Add/Run found in 'later' is preserved.
+Copy's get more difficult.
+We technically have several types of copy commands.
+We have a Copy in S (in superstring U) that is ultimately sourced from the Src Doc
+    lets call this CopySS.
+Then we have Copy in S and the S component of U is from our Output Doc;
+    lets call this CopySO.
+Finally we have a Copy that is in T of U.
+That is we are copying bytes from some earlier operation(s) applied.
+This one has two sub variants.
+It can be treated like a normal Copy, or it might be an implicit sequence;
+lets call the first CopyTU, and the implicit sequence CopyTS.
+
+We need to understand when these various copy commands have precedence in 'later' vs 'earlier' patch files.
+
+Here are my first thoughts:
+TU or TS found in 'later' can be preserved as-is, since these are indirectly references to *other instructions*.
+    However, we cannot add any new TU/TS to 'later'.
+SS or SO found in 'later' need to be 'dereferenced' to instructions in 'earlier'.
+    We need to replace the 'later' instructions with one or more instructions from 'earlier'.
+    This requires us potentially modifying the controlling instructions so that the length matches the copy instruction found.
+    This would require 'skipping' bytes on the first instruction, and potentially 'truncating' bytes off the last instruction.
+    ...If some of these instructions are TU or TS in 'earlier' we might have to do something more to them?
+    TS would need to be 'de-sequenced'. Since, the implicit nature of the the Copy requires the position in U for the sequence to work properly.
+    So we would need to walk through the 'earlier' patch to detect and make the implicit seq explicit in our code.
+    A TU encountered in 'earlier' can be directly placed in the 'later' patch?
+    Or does it need some sort of translation?
+
+A TU in the earlier patch would be referencing commands earlier commands from *its* patch file.
+However, this can only happen if we are de-referencing a CopyS* from the 'later' patch.
+Since we are selectively merging instructions, moving a TU/TS to 'later' does not semantically follow.
+We need to de-reference any found T* in earlier to some S* (*depends on win type we found T in) in later.
+*/
 struct MergeState<R,W>{
     cur_o_pos: u64,
     max_u_size: usize,
@@ -183,6 +221,7 @@ pub fn merge_patches<R: Read + Seek, W:Write>(sequential_patches: Vec<VCDTransla
         let expected_end = o_start + inst.len() as u64;
         input[0] = inst;
         resolve_list_of_inst(&mut state.sequential_patches,cntl_patch, &input, &mut resolution_buffer)?;
+        //dbg!(&resolution_buffer);
         for inst in resolution_buffer.drain(..){
             debug_assert!(inst.inst.len() > 0, "inst.len() == 0");
             state.apply_instruction(inst)?;
@@ -631,14 +670,17 @@ mod test_super {
         //"hello" -> "hello world!" -> "Hello! Hello! Hello. hello. hello..."
         //we need to use a series of VCD_TARGET windows and Sequences across multiple patches
         //we should use copy/seq excessively since add/run is simple in the code paths.
-        let src = b"hello";
+        let src = b"hello!";
         let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(5), source_segment_position: Some(0), size_of_the_target_window:12 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(5), source_segment_position: Some(0), size_of_the_target_window:5 , delta_indicator: DeltaIndicator(0) }).unwrap();
         // Instructions
         encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(1), source_segment_position: Some(4), size_of_the_target_window:6 , delta_indicator: DeltaIndicator(0) }).unwrap();
         encoder.next_inst(EncInst::ADD(" w".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 9 })).unwrap();
-        encoder.next_inst(EncInst::ADD("rld!".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(EncInst::ADD("rld".as_bytes().to_vec())).unwrap();
+        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(1), source_segment_position: Some(5), size_of_the_target_window:1 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
         let p1 = encoder.finish().unwrap().into_inner();
         let p1_answer = b"hello world!";
         let mut cursor = Cursor::new(p1.clone());

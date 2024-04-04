@@ -1,4 +1,4 @@
-use std::{fmt::Debug, io::{Read,Seek,Write}, ops::{Bound, Range, RangeBounds}};
+use std::{fmt::Debug, io::{Read,Seek,Write}, ops::Range};
 
 use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
 #[derive(Debug,Default)]
@@ -310,41 +310,31 @@ impl SparseCache
 
     }
 
-    pub fn get_src_subslice(&self, src_range: impl RangeBounds<u64>) -> &[u8] {
+    pub fn get_src_subslice(&self, src_range: Range<u64>) -> &[u8] {
         //panic if the slice is not already fully within some existing keys range.
         // Extract bounds from the provided range
-        let start = match src_range.start_bound() {
-            Bound::Included(&s) => s,
-            Bound::Excluded(&s) => s + 1,
-            Bound::Unbounded => 0,
-        };
-        let end = match src_range.end_bound() {
-            Bound::Included(&e) => e + 1,
-            Bound::Excluded(&e) => e,
-            Bound::Unbounded => self.buffer.len() as u64, // Assume the range extends to the end
-        };
-        let range = start..end;
         let mut slice_start = None;
         let mut last_end = 0;
         for Segment { src_start, buf_start, len } in &self.segment_map {
             let len = *len as u64;
-            if let Some(in_range) = range_overlap(&(*src_start..*src_start + len), &range) {
+            if let Some(in_range) = range_overlap(&(*src_start..*src_start + len), &src_range) {
                 let slice_end = src_start + len;
                 if slice_start.is_some() {
                     if last_end != *src_start {
                         panic!("Non-contiguous segments in the cache");
                     }
-                }else if in_range.start <= start{
-                    slice_start = Some(*buf_start + (start - src_start) as usize);
+                }else if in_range.start <= src_range.start{
+                    slice_start = Some(*buf_start + (src_range.start - src_start) as usize);
                 }
-                if end <= slice_end {
-                    let slice_end = *buf_start + len as usize - (slice_end - end) as usize;
+                if src_range.end <= slice_end {
+                    let slice_end = *buf_start + len as usize - (slice_end - src_range.end) as usize;
                     return &self.buffer[slice_start.unwrap()..slice_end];
                 }
             }
             last_end = *src_start + len;
         }
-        panic!("The slice is not fully within some existing keys range");
+
+        panic!("The slice is not fully within some existing keys range: {:?}",self.segment_map);
     }
 }
 

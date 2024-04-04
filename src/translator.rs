@@ -81,9 +81,6 @@ impl<R:Read+Seek> VCDTranslator<R> {
             cur_o_len: 0,
         })
     }
-    pub fn cur_o_pos(&self)->u64{
-        self.cur_o_len + (self.cur_u_pos - self.cur_t_start()) as u64
-    }
     pub fn cur_win_start_o_pos(&self)->u64{
         self.cur_o_len
     }
@@ -110,7 +107,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
     }
     pub fn exact_slice(&mut self, o_position: u64, len: u32) -> std::io::Result<Vec<Inst>> {
         self.load_up_to(o_position + len as u64)?;
-        Ok(self.retrieve_exact_slice_from_src_date(o_position, len).into_iter().map(|x|x.inst).collect())
+        Ok(self.retrieve_exact_slice_from_src_data(o_position, len).into_iter().map(|x|x.inst).collect())
     }
     pub fn interrogate(&mut self, o_position: u64) -> std::io::Result<Option<SparseInst>> {
         self.load_up_to(o_position)?;
@@ -201,6 +198,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
                 let ssp = cur_win.source_segment_position.unwrap();
                 buf.push(ProcessInst::Copy { copy, addr: CopyAddr::InS { sss, ssp },vcd_trgt });
             }else if copy.u_pos < self.cur_t_start() as u32{
+                //This case is technically disallowed by the spec
                 let sss = cur_win.source_segment_size.unwrap();
                 let ssp = cur_win.source_segment_position.unwrap();
 
@@ -314,7 +312,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     let trunc = cur_inst_end - slice_end;
                     cur_inst.trunc(trunc);
                 }
-                debug_assert!(cur_inst.len_in_t(pos) > 0);
+                debug_assert!(cur_inst.len() > 0);
                 slice.push(cur_inst);
             }
             if cur_inst_end >= slice_end {
@@ -324,7 +322,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         }
         slice
     }
-    fn retrieve_exact_slice_from_src_date(&self,o_position: u64,len: u32)->Vec<SparseInst>{
+    fn retrieve_exact_slice_from_src_data(&self,o_position: u64,len: u32)->Vec<SparseInst>{
         let mut last = 0;
         let mut slice = Vec::new();
         let range = o_position..o_position + len as u64;
@@ -354,15 +352,6 @@ impl<R:Read+Seek> VCDTranslator<R> {
         }
         slice
     }
-    fn get_global_slice(&self, u_pos: u32, len: u32) -> Vec<ProcessInst> {
-        //first we need to get our source window size and position
-        let cur_win = self.cur_win().unwrap();
-        debug_assert!( cur_win.is_vcd_target(), "We can only translate from a TargetSourcedWindow");
-        let ssp = cur_win.source_segment_position.unwrap();
-        let o_pos = ssp + u_pos as u64;
-        self.retrieve_exact_slice_from_src_date(o_pos, len).into_iter().map(|x|x.inst.as_proc_inst(false)).collect()
-    }
-
     // This handles cross-window translation using previously resolved instructions
     fn resolve_global(&mut self,input_buffer:&mut Vec<ProcessInst>){
         //the buffer here only contains instructions in S or they are ADD/RUNs
@@ -385,22 +374,25 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     output_buffer.push(ProcessInst::Sequence(s));
                 },
                 InstCopy::IsCopy { copy:COPY { len, u_pos }, addr, .. } => {
-                    assert!(!matches!(addr, CopyAddr::InT), "The COPY address should always be translated locally in a TrgtSourcedWindow");
                     //here u_pos should already be in S (resolve local should be ran first)
                     //S references our Output stream
-                    let mut slice = self.get_global_slice(u_pos, len);
-                    // //sanity check for len
-                    // debug_assert!(slice.iter().map(|x|x.len_in_u()).sum::<u32>() == len, "The slice length does not match the COPY length");
-                    output_buffer.append(&mut slice);
+                    match addr {
+                        CopyAddr::InS {  ssp,.. } => {
+                            let o_pos = ssp + u_pos as u64;
+                            let slice = self.retrieve_exact_slice_from_src_data(o_pos, len);
+                            output_buffer.extend(slice.into_iter().map(|x|x.inst.as_proc_inst(false)));
+                        },
+                        _ => panic!("The COPY address should always be translated locally in a TrgtSourcedWindow"),
+
+                    }
                 },
             }
         }
     }
 
     fn store_inst(&mut self,inst:ProcessInst){
-        let len = inst.len_in_t(self.cur_u_pos as u32);
+        let len = inst.len();
         let new_o_pos = self.cur_o_len + len as u64;
-        //do later things depend on this?
         self.src_data.push(inst.to_sparse_inst(self.cur_o_len));
         self.cur_u_pos += len as usize;
         self.cur_o_len = new_o_pos;
@@ -557,6 +549,7 @@ impl Inst {
 
 }
 
+///Sequence is explicit so its length is always known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProcessInst{
     ///This is a source instruction
@@ -613,27 +606,40 @@ impl ProcessInst {
             a => InstCopy::No(a)
         }
     }
-    fn len_in_t(&self, inst_u_start:u32) -> u32 {
+    fn len(&self)->u32{
         match self {
             Self::Add(inst) => {inst.len()},
             Self::Run(inst) => {inst.len()},
-            Self::Copy { copy:COPY { len, u_pos }, .. } => {
-                let u_pos = *u_pos as u32;
-                let end = u_pos + *len;
-                if end > inst_u_start {
-                    end - inst_u_start
-                }else{
-                    *len
-                }
-            },
+            Self::Copy { copy, .. } => {copy.len},
             Self::Sequence(ProcSequence { len, skip, trunc, ..}) => {
                 //cannot be zero len, we have a logical error somewhere
                 debug_assert!(skip + trunc < *len);
                 len - (skip + trunc)
             },
         }
-
     }
+    // fn len_in_t(&self, inst_u_start:u32) -> u32 {
+    //     match self {
+    //         Self::Add(inst) => {inst.len()},
+    //         Self::Run(inst) => {inst.len()},
+    //         Self::Copy { copy:COPY { len, u_pos }, .. } => {
+    //             let u_pos = *u_pos as u32;
+    //             let end = u_pos + *len;
+    //             dbg!(inst_u_start, u_pos, end, *len);
+    //             if end > inst_u_start {
+    //                 end - inst_u_start
+    //             }else{
+    //                 *len
+    //             }
+    //         },
+    //         Self::Sequence(ProcSequence { len, skip, trunc, ..}) => {
+    //             //cannot be zero len, we have a logical error somewhere
+    //             debug_assert!(skip + trunc < *len);
+    //             len - (skip + trunc)
+    //         },
+    //     }
+
+    // }
     fn skip(&mut self, amt: u32) {
         if amt == 0 {return}
         match self {
@@ -844,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overlapping_ranges() {
+    fn test_merge_overlapping_ranges() {
         let ranges = vec![
             Range { start: 5, end: 10 },
             Range { start: 3, end: 8 },
@@ -899,7 +905,45 @@ mod tests {
         assert_eq!(merge_ranges(ranges), expected);
     }
 
+    #[test]
+    fn test_overlapping_ranges() {
+        // Fully overlapping
+        let range1 = 1..10;
+        let range2 = 5..8;
+        assert_eq!(range_overlap(&range1, &range2), Some(5..8));
 
+        // Partially overlapping (start point)
+        let range1 = 0..6;
+        let range2 = 5..10;
+        assert_eq!(range_overlap(&range1, &range2), Some(5..6));
+
+        // Partially overlapping (end point)
+        let range1 = 5..10;
+        let range2 = 3..10;
+        assert_eq!(range_overlap(&range1, &range2), Some(5..10));
+    }
+
+    #[test]
+    fn test_non_overlapping_ranges() {
+        // Adjacent ranges
+        let range1 = 1..5;
+        let range2 = 5..10;
+        assert_eq!(range_overlap(&range1, &range2), None);
+
+        // Disjoint ranges
+        let range1 = 1..5;
+        let range2 = 10..15;
+        assert_eq!(range_overlap(&range1, &range2), None);
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Identical ranges
+        let range1 = 3..7;
+        let range2 = 3..7;
+        assert_eq!(range_overlap(&range1, &range2), Some(3..7));
+
+    }
 
     use crate::encoder::{VCDEncoder, EncInst,WindowHeader};
     use crate::reader::{Header,WinIndicator, DeltaIndicator};
