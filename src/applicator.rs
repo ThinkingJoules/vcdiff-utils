@@ -1,6 +1,27 @@
 use std::{fmt::Debug, io::{Read,Seek,Write}, ops::{Bound, Range, RangeBounds}};
 
 use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{find_dep_ranges, gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
+#[derive(Debug,Default)]
+struct Stats{
+    add: usize,
+    copy: usize, //non-implicit sequence copys
+    run: usize,
+    seq: usize, //implicit sequence copys
+}
+impl Stats{
+    fn add(&mut self){
+        self.add += 1;
+    }
+    fn copy(&mut self){
+        self.copy += 1;
+    }
+    fn run(&mut self){
+        self.run += 1;
+    }
+    fn seq(&mut self){
+        self.seq += 1;
+    }
+}
 
 pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sink:&mut W) -> std::io::Result<()> {
     //to avoid the Read+Seek bound on sink,
@@ -14,6 +35,9 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
     let mut sink_cache = SparseCache::new();
     let mut o_pos = 0;
     let mut t_pos = 0;
+
+    let mut stats = Stats::default();
+
     loop{
         let msg = decoder.next()?;
         match msg{
@@ -30,6 +54,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                     },
                     _ => *size_of_the_target_window,
                 } as usize;
+                stats = Stats::default();
                 debug_assert!(cur_u.is_empty());
                 if cur_u.capacity() < needed_capacity {
                     cur_u.reserve(needed_capacity - cur_u.capacity());
@@ -61,12 +86,19 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                             let mut slice = vec![0u8;len_in_t];
                             patch_r.read_exact(&mut slice)?;
                             cur_u.append(&mut slice);
+                            stats.add();
                         },
                         DecInst::Copy(COPY{  u_pos, len:copy_in_u }) => {
                             let u_pos = u_pos as usize;
                             //first figure out if this is an implicit sequence
                             let cur_end = cur_u.len();
                             let copy_end = u_pos + copy_in_u as usize;
+                            debug_assert!(u_pos < cur_end,"{:?} >= {:?}",u_pos,cur_end);
+                            if copy_end > cur_end {
+                                stats.seq();
+                            }else{
+                                stats.copy();
+                            }
                             unsafe{
                                 // Get raw pointers
                                 let cur_u_ptr = cur_u.as_mut_ptr();
@@ -84,6 +116,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                                         (copy_len,seq_offset+u_pos)
                                     } else{//regular copy
                                         //this should run the loop a single time
+                                        debug_assert!(amt_copied == 0);
                                         (copy_in_u as usize, u_pos as usize)
                                     };
                                     // Calculate offsets for copying
@@ -99,6 +132,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                             }
                         },
                         DecInst::Run(RUN{  byte, .. }) => {
+                            stats.run();
                             cur_u.extend(std::iter::repeat(byte).take(len_in_t));
                         },
                     }
@@ -112,11 +146,13 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                 //so we need to cache what we can
 
                 //currently o_pos is at the start of our cur_window
-                let t_len = ws.take().unwrap().size_of_the_target_window;
-                assert_eq!(t_pos,t_len as usize);
+                let summary = ws.take().unwrap();
+                let t_len = summary.size_of_the_target_window;
+                //println!("Stats: {:?}",stats);
+                assert_eq!(t_pos,t_len as usize,"{:?}",summary);
                 //t_start should logically line up with the current value in o_pos
                 //however they will be a different actual value
-                let t_start = cur_u.len() - t_len as usize;
+                let t_start = summary.source_segment_size.unwrap_or(0) as usize;
                 let to_cache = merge_ranges(find_intersections(&(o_pos..o_pos+t_len), &dependencies));
                 for Range { start, end } in to_cache {
                     let len = end-start;
@@ -124,7 +160,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                 }
                 o_pos += t_len; //now we move the o_pos
                 t_pos = 0;
-                sink.write_all(&cur_u[t_start..])?;
+                sink.write_all(&cur_u[t_start..t_start+t_len as usize])?;
                 cur_u.clear();
             },
             VCDiffDecodeMsg::EndOfFile => break,

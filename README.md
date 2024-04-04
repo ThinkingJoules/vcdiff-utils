@@ -1,0 +1,3 @@
+TODO:
+- Re-write encoder. There is an error in the encoding of some copy address. For now, am just encoding everything as mode 0 in the merged patch file. There error could be in the cache, but it looks correct. The assertion never triggers but I get decode errors, which mean we are feeding it incorrect data that makes it out of sync with the decode cache.
+- Re-write Merger. Get rid of translator entirely? We need to work two patches at a time. I think we need to just load all instructions in to memory from earlier patch

@@ -77,6 +77,7 @@ pub struct Cache {
 impl Cache {
     const S_NEAR: usize = 4;
     const S_SAME: usize = 3;
+    const SAME_START: usize = Self::S_NEAR + 2;
     pub fn new() -> Self {
         Cache {
             near: [0; Self::S_NEAR],
@@ -100,9 +101,10 @@ impl Cache {
         res
     }
     pub fn peek_addr_encode(&self, addr: usize, here: usize) -> (u32, u8){
+        assert!(addr < here,"addr can not be ahead of cur pos");
+        return (addr as u32,0);
         let mut best_distance = addr;
         let mut best_mode = 0; // VCD_SELF
-
         // VCD_HERE
         let distance = here - addr;
         if distance < best_distance {
@@ -122,7 +124,7 @@ impl Cache {
         let distance = addr % (Self::S_SAME * 256);
         if self.same[distance] == addr {
             best_distance = distance % 256;
-            best_mode = Self::S_NEAR + 2 + distance / 256;
+            best_mode = Self::SAME_START + distance / 256;
         }
         (best_distance as u32, best_mode as u8)
     }
@@ -132,32 +134,38 @@ impl Cache {
     /// **here** is the current position in the target output
     /// **mode** is the mode of the address
     /// returns (address, bytes_read_from_addr_section)
-    pub fn addr_decode<R:Read>(&mut self, addr_section: &mut R, here: u64, mode: usize) ->  std::io::Result<(u64,usize)> {
+    pub fn addr_decode(&mut self, read_value:u64, here: u64, mode: usize) -> u64 {
         let addr;
-        let read;
-        if mode == 0 { // VCD_SELF
-            let (x,a) = decode_integer(addr_section)?;
-            addr = x;
-            read = a;
-        } else if mode == 1 { // VCD_HERE
-            let (x,a) = decode_integer(addr_section)?;
-            addr = here - x;
-            read = a;
-        } else if mode >= 2 && mode - 2 < Cache::S_NEAR {  // Near cache
-                let near_index = mode - 2;
-                let (x,a) = decode_integer(addr_section)?;
-                addr = self.near[near_index] as u64 + x;
-                read = a;
-        } else { // Same cache
-            let m = mode - (2 + Cache::S_NEAR);
-            let mut byte = [0u8];
-            addr_section.read_exact(&mut byte)?;
-            let same_index = m * 256 + byte[0] as usize;
+        if mode < Self::SAME_START{
+            match mode {
+                0 => {
+                    addr = read_value
+                },
+                1 => {
+                    addr = here - read_value;
+                },
+                m => {
+                    let near_index = m - 2;
+                    addr = self.near[near_index] as u64 + read_value;
+                }
+            }
+        }else{// Same cache
+            let m = mode - Self::SAME_START;
+            assert!(read_value <= u8::MAX as u64,"read value is too large");
+            let same_index = m * 256 + read_value as usize;
             addr = self.same[same_index] as u64;
-            read = 1;
         }
+
+        // assert!(addr < here as u64,
+        //     "here: {} addr: {} mode: {} math: {}",
+        //     here,addr,mode,
+        //     if mode == 0 { addr.to_string() }
+        //     else if mode == 1 { format!("addr{}=here({})-x({})",addr,here,here-addr) }
+        //     else if mode >= 2 && mode - 2 < Cache::S_NEAR { format!("near_index:{} value={}, x={}",mode-2,self.near[mode-2],addr-self.near[mode-2] as u64) }
+        //     else { "TODO".to_string() },
+        // );
         self.update(addr as usize);
-        Ok((addr,read))
+        addr
     }
 }
 
@@ -247,7 +255,7 @@ pub fn decode_integer<R: std::io::Read>(source: &mut R) -> std::io::Result<(u64,
         byte_count += 1;
         let shift = 63 - (byte_count * 7); // Adjust shift based on byte count
         let bits = (byte[0] & 0x7F) as u64;
-        value += bits << shift;
+        value = value.checked_add(bits << shift).expect("Overflow");
 
         if byte[0] & 0x80 == 0 { // If this is the last byte
             break;
@@ -340,7 +348,6 @@ mod test_super {
     fn test_len() -> () {
         assert_eq!(integer_encoded_size(TEST_VALUE), CORRECT_ENCODING.len(), "Length mismatch");
     }
-    use std::io::Cursor;
     #[test]
     fn test_vcd_self_mode() {
         // Test VCD_SELF mode (address encoded by itself)
@@ -358,11 +365,9 @@ mod test_super {
         assert_eq!(encoded_value, expected_value as u32);
         assert_eq!(mode, expected_mode);
 
-        // Mock reading the encoded value from address section
-        let mut reader = Cursor::new(vec![100]); // Encoded value 100
 
         // Decode
-        let (decoded_address, _) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+        let decoded_address = cache.addr_decode(100, here as u64, mode as usize);
 
         // Expected decoded address based on the encoding
         assert_eq!(decoded_address, expected_value as u64);
@@ -384,11 +389,9 @@ mod test_super {
         assert_eq!(encoded_value, expected_value as u32); // Cast to u32 for size comparison
         assert_eq!(mode, expected_mode);
 
-        // Mock reading the encoded value from address section
-        let mut reader = Cursor::new(vec![50]); // Encoded value 100
 
         // Decode
-        let (decoded_address,_) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+        let decoded_address = cache.addr_decode(50,here as u64, mode as usize);
 
         // Expected decoded address based on the encoding
         assert_eq!(decoded_address, here as u64 - expected_value as u64);
@@ -413,10 +416,8 @@ mod test_super {
         assert_eq!(encoded_value, expected_value as u32);
         assert_eq!(mode, expected_mode);
 
-        // Mock reading the encoded value from address section
-        let mut reader = Cursor::new(vec![10]); // Encoded value 10
         // Decode
-        let (decoded_address,_) = cache.addr_decode(&mut reader, here as u64, mode as usize).unwrap();
+        let decoded_address = cache.addr_decode(10, here as u64, mode as usize);
 
         // Expected decoded address based on the encoding
         assert_eq!(decoded_address, (100 + expected_value) as u64);
@@ -444,18 +445,14 @@ mod test_super {
         assert_eq!(encoded_value as usize, byte_value); // Encoded value is the byte itself
         assert_eq!(mode, expected_mode as u8);
 
-        // Mock reading the encoded value (offset and byte value combined)
-        let mut reader = Cursor::new(vec![(offset % 256) as u8, byte_value as u8]);
-
         // Decode
-        let (decoded_address, _) = cache.addr_decode(&mut reader, 0, mode as usize).unwrap();
+        let decoded_address = cache.addr_decode(encoded_value as u64, 0, mode as usize);
 
         // Expected decoded address based on the encoding
         assert_eq!(decoded_address, target_addr as u64);
     }
 
 }
-use std::io::Read;
 
 use TableInst::*;
 pub const VCD_C_TABLE: [CodeTableEntry;256] = [

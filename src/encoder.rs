@@ -81,7 +81,7 @@ impl<W: Write> VCDEncoder<W> {
         let idx = (self.buffer_pos + offset) % 3;
         //if nothing exists at idx we do nothing
         if let Some(inst) = self.buffer[idx].as_ref() {
-            let cur_inst_len = inst.len_in_t(self.cur_u_pos());
+            //let cur_inst_len = inst.len_in_t(self.cur_u_pos());
             // 1. Mode Retrieval (For COPY)
             let (f_addr,f_mode) = match &inst {
                 EncInst::COPY(copy) => {
@@ -91,14 +91,14 @@ impl<W: Write> VCDEncoder<W> {
                 EncInst::ADD(_) => (0,0), //ADD pass through
                 a => {//RUN short circuit
                     let first = TableInst::from_enc_inst_first(a,0);
-                    self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),None);
+                    self.encode_first_inst(offset, 0,first.size(),None);
                     return;
                 },
             };
             //first inst is not Run, so we need to try the second inst
             let first = TableInst::from_enc_inst_first(&inst,f_mode);
-            if let Some(next) = self.buffer[(idx + 1) % 3].as_ref() {
-                let sec_here = self.cur_u_pos()+cur_inst_len;
+            if let Some(next) = self.buffer[(self.buffer_pos + offset + 1) % 3].as_ref() {
+                let sec_here = self.cur_u_pos()+inst.len_in_u();//+cur_inst_len;
                 let s_mode = match &next {
                     EncInst::COPY(copy) => {
                         self.caches.peek_addr_encode(copy.u_pos as usize, sec_here as usize).1
@@ -136,7 +136,8 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx this will panic
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        self.cur_t_size += inst.len_in_t(self.cur_u_pos());
+        let len = inst.len_in_t(self.cur_u_pos());
+        self.cur_t_size += len;
         self.inst_buffer.push(op_code);
         self.encode_inst_to_buffers(inst, size, addr);
     }
@@ -286,6 +287,7 @@ impl EncInst {
             EncInst::ADD(data) => data.len() as u32,
             EncInst::RUN(run) => run.len,
             EncInst::COPY(COPY { len, u_pos }) =>{
+                assert!(u_pos < &cur_u_pos, "COPY address must be less than the current U position");
                 let u_pos = *u_pos as u32;
                 let end = u_pos + *len;
                 if end > cur_u_pos {

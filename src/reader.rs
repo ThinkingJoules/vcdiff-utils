@@ -51,9 +51,7 @@ impl<R: Read + Seek> VCDReader<R> {
         self.moved = true; //let the next call seek
     }
     pub fn read_from_src(&mut self,from_start:u64, buf:&mut [u8])->io::Result<()>{
-        self.source.seek(io::SeekFrom::Start(from_start))?;
-        self.moved = true;
-        self.source.read_exact(buf)
+        self.get_reader(from_start)?.read_exact(buf)
     }
     pub fn get_reader(&mut self,at_from_start:u64)->io::Result<&mut R>{
         self.moved = true;

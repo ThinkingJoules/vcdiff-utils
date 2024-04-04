@@ -56,34 +56,36 @@ We will probably only ever end up truncating COPY commands. Not sure when a merg
 pub struct VCDTranslator<R>{
     ///The reader for the VCDIFF file
     decoder: VCDDecoder<R>,
-    ///These are sorted, so we just look at 'last' and pop it off once we have passed the end position.
-    dependencies: Vec<Range<u64>>,
     windows: Vec<WindowSummary>,
     win_index: usize,
-    ///Used to resolve dependencies for TrgtSourcedWindows
+    ///Completed Windows are stored here
     src_data: Vec<SparseInst>,
-    cur_window_inst: Vec<(ProcessInst,u32)>,
-    cur_o_pos: u64,
+    ///This is from completed windows in src_data
+    cur_o_len: u64,
+    ///In src_data, where is the first inst for this window
+    cur_win_start_idx: usize,
     cur_u_pos: usize,
 }
 
 impl<R:Read+Seek> VCDTranslator<R> {
     pub fn new(mut decoder: VCDDecoder<R>) -> std::io::Result<Self> {
         let windows = gather_summaries(&mut decoder.reader().get_reader(0)?)?;
-        let dependencies = find_dep_ranges(&windows);
+
         Ok(VCDTranslator {
             decoder,
-            dependencies,
             cur_u_pos: windows[0].source_segment_size.map(|x|x as usize).unwrap_or(0),
             windows,
             win_index: 0,
             src_data: Vec::new(),
-            cur_window_inst: Vec::new(),
-            cur_o_pos: 0,
+            cur_win_start_idx: 0,
+            cur_o_len: 0,
         })
     }
     pub fn cur_o_pos(&self)->u64{
-        self.cur_o_pos
+        self.cur_o_len + (self.cur_u_pos - self.cur_t_start()) as u64
+    }
+    pub fn cur_win_start_o_pos(&self)->u64{
+        self.cur_o_len
     }
     pub fn into_inner(self)->VCDDecoder<R>{
         self.decoder
@@ -97,58 +99,8 @@ impl<R:Read+Seek> VCDTranslator<R> {
     pub fn cur_t_start(&self)->usize{
         self.cur_win().unwrap().source_segment_size.map(|x|x as usize).unwrap_or(0)
     }
-    fn pos_is_in_cur_win(&self, o_position:u64)->bool{
-        let start = self.cur_o_pos - (self.cur_u_pos - self.cur_t_start()) as u64;
-        let end = start + self.cur_win().unwrap().size_of_the_target_window;
-        (start..end).contains(&o_position)
-    }
-    fn set_window(&mut self,contains_o_position:u64)->std::io::Result<()>{
-        debug_assert!(!self.pos_is_in_cur_win(contains_o_position), "We are already in the correct window");
-        if !self.dependencies.is_empty() && contains_o_position > self.cur_o_pos {//if we have deps, and we are fast-forwarding
-            'outer: while let Some(r) = self.dependencies.last().cloned() {
-                if r.start > contains_o_position {
-                    break;
-                }
-                //else we need to store deps
-                while self.cur_o_pos <= r.end {
-                    let count = self.next_op()?;
-                    if count == 0 {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        let mut o_pos = 0;
-        let mut win = None;
-        for (i,ws) in self.windows.iter().enumerate(){
-            let end = o_pos + ws.size_of_the_target_window;
-            if (o_pos..end).contains(&contains_o_position) {
-                win = Some(ws.clone());
-                self.win_index = i;
-                break;
-            }
-            o_pos += ws.size_of_the_target_window;
-        }
-        if let Some(win) = win {
-            // self.set_new_window_state(&win);
-            self.cur_o_pos = o_pos;
-            self.decoder.seek_to_window(&win);
-        }
-        Ok(())
-    }
-    fn rewind_to_start_of_cur_win(&mut self){
-        let cur_u = self.cur_u_pos;
-        let rewind = cur_u - self.cur_t_start();
-        self.cur_u_pos = self.cur_t_start();
-        self.cur_o_pos -= rewind as u64;
-        let ws = self.cur_win().unwrap().clone();
-        self.decoder.seek_to_window(&ws);
-    }
     fn load_up_to(&mut self, o_position:u64)->std::io::Result<()>{
-        if !self.pos_is_in_cur_win(o_position) {
-            self.set_window(o_position)?;
-        }
-        while self.cur_o_pos <= o_position {//will fall through if it is a prev inst.
+        while self.cur_o_len <= o_position {//will fall through if it is a prev inst.
             let count = self.next_op()?;
             if count == 0 {
                 break;
@@ -157,72 +109,30 @@ impl<R:Read+Seek> VCDTranslator<R> {
         Ok(())
     }
     pub fn exact_slice(&mut self, o_position: u64, len: u32) -> std::io::Result<Vec<Inst>> {
-        if !self.pos_is_in_cur_win(o_position) {
-            self.set_window(o_position)?;
-        }else{
-            self.rewind_to_start_of_cur_win();
-        }
-        let mut last_count = 0;
-        let mut o_pos = self.cur_o_pos; //at start of window
-        while self.cur_o_pos < o_position {
-            last_count = self.next_op()?;
-
-            if last_count == 0 {
-                panic!("o_position exceeds patch file") //o position exceeds the patch file
-            }
-        }
-        //at this point the first inst is the last in the cur win vec
-        let mut num_inst = last_count;
-        let slice_end = o_position + len as u64;
-        while self.cur_o_pos < slice_end {
-            last_count = self.next_op()?;
-            num_inst += last_count;
-            if last_count == 0 {
-                panic!("o_position + len exceeds patch file") //o position exceeds the patch file
-            }
-        }
-        let mut buf = Vec::with_capacity(num_inst+2);
-        for (inst,len_in_t) in self.cur_window_inst.iter(){
-
-            let cur_inst_start = o_pos;
-            let cur_inst_end = o_pos + *len_in_t as u64;
-            if cur_inst_start >= o_position || cur_inst_end > o_position {
-                let mut cur_inst = inst.clone();
-                if cur_inst_start < o_position {
-                    let skip = o_position - o_pos;
-                    cur_inst.skip(skip as u32);
-                }
-                if cur_inst_end > slice_end {
-                    let trunc = cur_inst_end - slice_end;
-                    cur_inst.trunc(trunc as u32);
-                }
-                buf.push(cur_inst.to_inst());
-            }
-            o_pos = cur_inst_end;
-            if cur_inst_end >= slice_end{
-                break;
-            }
-        }
-        debug_assert!(o_pos >= slice_end, "We have not reached the end of the slice");
-        Ok(buf)
+        self.load_up_to(o_position + len as u64)?;
+        Ok(self.retrieve_exact_slice_from_src_date(o_position, len).into_iter().map(|x|x.inst).collect())
     }
     pub fn interrogate(&mut self, o_position: u64) -> std::io::Result<Option<SparseInst>> {
         self.load_up_to(o_position)?;
-        Ok(self.interrogate_prev(o_position))
-    }
-    fn interrogate_prev(&self, o_position: u64)->Option<SparseInst>{
-        let mut pos = self.cur_o_pos;
-        for (inst,len_in_t) in self.cur_window_inst.iter().rev() {
-            let cur_inst_start = pos - *len_in_t as u64;
-            if (cur_inst_start..pos).contains(&o_position) {
-                return Some(inst.to_sparse_inst(cur_inst_start));
+        let inst = self.src_data.binary_search_by(|probe|{
+            let end = probe.o_start + probe.inst.len() as u64;
+            if (probe.o_start..end).contains(&o_position){
+                return std::cmp::Ordering::Equal
+            }else if end <= o_position {
+                return std::cmp::Ordering::Less
+            }else{
+                return std::cmp::Ordering::Greater
             }
-            pos = cur_inst_start;
+        });
+        if let Ok(idx) = inst {
+            return Ok(Some(self.src_data[idx].clone()));
+        }else {
+            return Ok(None)
         }
-        None
+
     }
     fn set_new_window_state(&mut self,ws:&WindowSummary){
-        self.cur_window_inst.clear(); //we only store one windows inst at a time.
+        self.cur_win_start_idx = self.src_data.len();
         self.cur_u_pos = ws.source_segment_size.map(|x|x as usize).unwrap_or(0);
     }
     ///This returns a 'root' instruction that controls the byte at the given position in the output stream.
@@ -328,7 +238,7 @@ impl<R:Read+Seek> VCDTranslator<R> {
         if let Some(len) = is_seq {
             self.store_inst(ProcessInst::Sequence(ProcSequence { inst: buf, len: len as u32, skip: 0, trunc: 0}));
         }else{
-            self.cur_window_inst.reserve(count);
+            self.src_data.reserve(count);
             for inst in buf.drain(..) {
                 self.store_inst(inst);
             }
@@ -391,11 +301,11 @@ impl<R:Read+Seek> VCDTranslator<R> {
         let mut pos = src_size;
         let slice_end = u_pos + len;
         let range = u_pos..slice_end;
-        for (inst,len_in_t) in self.cur_window_inst.iter() {
-            let len = len_in_t;//inst.len_in_t(src_size+pos);
+        for SparseInst { inst, .. } in self.src_data[self.cur_win_start_idx..].iter() {
+            let len = inst.len();//len_in_t;//inst.len_in_t(src_size+pos);
             let cur_inst_end = pos + len;
             if let Some(_) = range_overlap(&(pos..cur_inst_end), &range) {
-                let mut cur_inst = inst.clone();
+                let mut cur_inst = inst.as_proc_inst(false);
                 if u_pos >= pos {
                     let skip = u_pos - pos;
                     cur_inst.skip(skip);
@@ -414,27 +324,17 @@ impl<R:Read+Seek> VCDTranslator<R> {
         }
         slice
     }
-
-    fn get_global_slice(&self, u_pos: u32, len: u32) -> Vec<ProcessInst> {
-        //first we need to get our source window size and position
-        let cur_win = self.cur_win().unwrap();
-        debug_assert!( cur_win.is_vcd_target(), "We can only translate from a TargetSourcedWindow");
-        let ssp = cur_win.source_segment_position.unwrap();
-        let o_pos = ssp + u_pos as u64;
-        //sanity check that we are indeed in S.
-        //debug_assert!(u_pos + len <= cur_win.source_segment_size.unwrap() as u32, "{} + {} <= {}", u_pos, len, cur_win.source_segment_size.unwrap() as u32);
-        let slice_end = o_pos + len as u64;
-        let range = o_pos as u64..slice_end;
-
+    fn retrieve_exact_slice_from_src_date(&self,o_position: u64,len: u32)->Vec<SparseInst>{
+        let mut last = 0;
         let mut slice = Vec::new();
-        let mut last = 0; //to assert contiguous SparseInst
+        let range = o_position..o_position + len as u64;
         for SparseInst { o_start, inst } in self.src_data.iter() {
             let inst_len = inst.len();
             let cur_inst_end = o_start + inst_len as u64;
             debug_assert!(if !slice.is_empty(){last == *o_start}else{true});
 
             if let Some(overlap) = range_overlap(&(*o_start..cur_inst_end), &range) {
-                let mut cur_inst = inst.as_proc_inst(false);//false because we have already processed these
+                let mut cur_inst = inst.clone();
 
                 if overlap.start > *o_start {
                     let skip = overlap.start - *o_start;
@@ -444,15 +344,23 @@ impl<R:Read+Seek> VCDTranslator<R> {
                     let trunc = cur_inst_end - overlap.end;
                     cur_inst.trunc(trunc as u32);
                 }
-                //debug_assert!(cur_inst.len_in_t(u32::MAX) > 0, "The instruction length is zero");
-                slice.push(cur_inst);
+                debug_assert!(cur_inst.len() > 0, "The instruction length is zero");
+                slice.push(SparseInst { o_start: *o_start, inst: cur_inst });
             }
-            if cur_inst_end >= slice_end {
+            if cur_inst_end >= range.end {
                 break;
             }
             last = cur_inst_end;
         }
         slice
+    }
+    fn get_global_slice(&self, u_pos: u32, len: u32) -> Vec<ProcessInst> {
+        //first we need to get our source window size and position
+        let cur_win = self.cur_win().unwrap();
+        debug_assert!( cur_win.is_vcd_target(), "We can only translate from a TargetSourcedWindow");
+        let ssp = cur_win.source_segment_position.unwrap();
+        let o_pos = ssp + u_pos as u64;
+        self.retrieve_exact_slice_from_src_date(o_pos, len).into_iter().map(|x|x.inst.as_proc_inst(false)).collect()
     }
 
     // This handles cross-window translation using previously resolved instructions
@@ -489,29 +397,13 @@ impl<R:Read+Seek> VCDTranslator<R> {
         }
     }
 
-
-    fn update_deps(&mut self){
-        while let Some(r) = self.dependencies.last() {
-            if r.end <= self.cur_o_pos {
-                self.dependencies.pop();
-            }else{
-                break;
-            }
-        }
-    }
     fn store_inst(&mut self,inst:ProcessInst){
         let len = inst.len_in_t(self.cur_u_pos as u32);
-        let new_o_pos = self.cur_o_pos + len as u64;
+        let new_o_pos = self.cur_o_len + len as u64;
         //do later things depend on this?
-        if let Some(r) = self.dependencies.last() {
-            if r.start <= self.cur_o_pos || r.end > new_o_pos {
-                self.src_data.push(inst.to_sparse_inst(self.cur_o_pos));
-            }
-        }
+        self.src_data.push(inst.to_sparse_inst(self.cur_o_len));
         self.cur_u_pos += len as usize;
-        self.cur_o_pos = new_o_pos;
-        self.cur_window_inst.push((inst,len));
-        self.update_deps();
+        self.cur_o_len = new_o_pos;
     }
 }
 
@@ -642,6 +534,25 @@ impl Inst {
             },
         }
 
+    }
+    fn skip(&mut self, amt: u32) {
+        if amt == 0 {return}
+        match self {
+
+            Self::Sequence(Sequence { skip, .. }) => {*skip += amt as u32;},
+            Self::Add(inst) => {inst.skip(amt);},
+            Self::Run(inst) => {inst.skip(amt);},
+            Self::Copy (copy) => {copy.copy.skip(amt);},
+        }
+    }
+    fn trunc(&mut self, amt: u32){
+        if amt == 0 {return}
+        match self {
+            Self::Add(inst) => {inst.trunc(amt);},
+            Self::Run(inst) => {inst.trunc(amt);},
+            Self::Copy(copy) => {copy.copy.trunc(amt);},
+            Self::Sequence(Sequence {trunc ,..}) => {*trunc += amt as u32;},
+        }
     }
 
 }

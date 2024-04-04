@@ -1,6 +1,6 @@
 use std::io::{Read, Seek};
 
-use crate::{reader::{VCDReader, VCDiffReadMsg, WindowSummary}, Cache, CodeTableEntry, TableInst, ADD, COPY, RUN, VCD_C_TABLE};
+use crate::{decode_integer, reader::{VCDReader, VCDiffReadMsg, WindowSummary}, Cache, CodeTableEntry, TableInst, ADD, COPY, RUN, VCD_C_TABLE};
 
 
 ///Decoded instruction
@@ -84,6 +84,9 @@ impl<R: Read + Seek> VCDDecoder<R> {
     pub fn u_position(&self) -> u64 {
         self.cur_u_position
     }
+    pub fn peek_cache(&self) -> &Cache {
+        &self.caches
+    }
     fn handle_inst(&mut self, inst: TableInst) -> std::io::Result<Option<DecInst>> {
         Ok(match inst{
             TableInst::Run => {
@@ -112,10 +115,25 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 let len = if size == 0 {
                     self.reader.read_as_inst_size_unchecked()?
                 }else{size as u64};
-
-                let (addr,read) = self.caches.addr_decode(self.reader.get_reader(self.addr_pos)?, self.cur_u_position, mode as usize)?;
-                let inst = DecInst::Copy(COPY { len: len as u32, u_pos: addr as u32 });
+                let (value,read) = if mode < Cache::SAME_START as u8 {
+                    //read int
+                    decode_integer(self.reader.get_reader(self.addr_pos)?)?
+                }else{
+                    //read byte
+                    let mut byte = [0u8];
+                    self.reader.read_from_src(self.addr_pos, &mut byte)?;
+                    (byte[0] as u64, 1)
+                };
+                let addr = self.caches.addr_decode(value, self.cur_u_position, mode as usize);
+                if addr >= self.cur_u_position as u64{
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Address is out of bounds: {:?} >= {:?} (mode: {} len: {}) encoded {} ",
+                        addr, self.cur_u_position,mode,len,value))
+                    );
+                }
                 self.addr_pos += read as u64;
+                let inst = DecInst::Copy(COPY { len: len as u32, u_pos: addr as u32 });
                 let len_t = inst.len_in_t(self.cur_u_position as usize) as u64;
                 self.cur_u_position += len_t;
 

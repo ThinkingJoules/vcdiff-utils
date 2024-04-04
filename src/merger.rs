@@ -5,7 +5,6 @@ use crate::{encoder::{EncInst, VCDEncoder, WindowHeader}, reader::{Header, WinIn
 
 struct MergeState<R,W>{
     cur_o_pos: u64,
-    crsr_o_pos: u64,
     max_u_size: usize,
     cur_win: Vec<MergedInst>,
     win_sum: Option<WindowHeader>,
@@ -27,11 +26,13 @@ impl<R:Read+Seek,W:Write> MergeState<R,W> {
             let inst_s = ci.inst.src_range();
             let remaining_size = self.max_u_size as u64 - self.current_u_size() as u64;
             match (cur_s,inst_s) {
-                (Some((sss,ssp)), Some(r)) => {
-                    if let Some(disjoint) = get_disjoint_range(ssp..ssp+sss, r){
-                        let disjoin_len = disjoint.end - disjoint.start;
+                (Some((ssp,sss)), Some(r)) => {
+                    if let Some(disjoint) = get_disjoint_range(ssp..ssp+sss, r.clone()){
+                        let disjoint_len = disjoint.end - disjoint.start;
                         //if this is larger than our remaining window, we need to flush, splitting won't help
-                        if disjoin_len > remaining_size{
+                        if disjoint_len > remaining_size{
+                            // println!("flushing (disjoint), cur_o_pos: {} cur_win_size: {} max_u_size: {}", self.cur_o_pos, self.current_window_size(), self.max_u_size);
+                            // println!("sss: {} ssp: {} r: {:?} disjoin_len {:?} remaining {}", sss,ssp,r,disjoint_len,remaining_size);
                             self.flush_window()?;
                             //we have invalidated our variables so loop again
                             cur_inst = Some(ci);
@@ -43,7 +44,8 @@ impl<R:Read+Seek,W:Write> MergeState<R,W> {
                 _ => (),
             }
             //if we are here we can naively check if we need to split the inst
-            let trunc = ci.inst.max_u_trunc_amt(remaining_size as u32);
+            let trunc = ci.inst.max_u_trunc_amt((self.max_u_size - self.current_u_size()) as u32);
+            debug_assert!(trunc < ci.inst.len() as u32, "trunc: {} len: {}",trunc,ci.inst.len());
             if trunc > 0{
                 let (first,second) = Self::split_inst(ci,trunc);
                 self.add_to_window(first);
@@ -55,7 +57,8 @@ impl<R:Read+Seek,W:Write> MergeState<R,W> {
         }
         //only if o_pos == crsr_pos do we check again if we should flush the window.
         //we give it an extra 5 bytes so we don't truncate down to a inst len of 1;
-        if self.cur_o_pos == self.crsr_o_pos && self.current_window_size() + 5 >= self.max_u_size as usize{
+        if self.current_window_size() + 5 >= self.max_u_size as usize{
+            // println!("flushing (normal), cur_o_pos: {} cur_win_size: {} max_u_size: {}", self.cur_o_pos, self.current_window_size(), self.max_u_size);
             self.flush_window()?;
         }
         Ok(())
@@ -75,6 +78,9 @@ impl<R:Read+Seek,W:Write> MergeState<R,W> {
             }
         }
         ws.size_of_the_target_window = trgt_win_size;
+        if self.cur_o_pos == 166972041{
+            println!("cur_o_pos: {} inst: {:?}",self.cur_o_pos,inst);
+        }
         self.cur_o_pos += inst.len() as u64;
 
         self.cur_win.push(MergedInst{inst,patch_index});
@@ -161,7 +167,6 @@ pub fn merge_patches<R: Read + Seek, W:Write>(sequential_patches: Vec<VCDTransla
     let encoder = VCDEncoder::new(sink,header)?;
     let mut state = MergeState{
         cur_o_pos: 0,
-        crsr_o_pos: 0,
         cur_win: Vec::new(),
         sink: encoder,
         sequential_patches,
@@ -174,16 +179,14 @@ pub fn merge_patches<R: Read + Seek, W:Write>(sequential_patches: Vec<VCDTransla
     let mut input = [Inst::Run(RUN { len: 0,byte:0 }); 1];
     let mut resolution_buffer = Vec::new();
     while let Some(SparseInst { o_start, inst }) = state.next()? {
+        debug_assert!(inst.len() > 0, "{:?}",inst);
         let expected_end = o_start + inst.len() as u64;
-        dbg!(&inst,state.cur_o_pos);
         input[0] = inst;
         resolve_list_of_inst(&mut state.sequential_patches,cntl_patch, &input, &mut resolution_buffer)?;
-        dbg!(&resolution_buffer);
         for inst in resolution_buffer.drain(..){
             debug_assert!(inst.inst.len() > 0, "inst.len() == 0");
             state.apply_instruction(inst)?;
         }
-        //dbg!(&state.cur_win);
         debug_assert_eq!(state.cur_o_pos, expected_end, "cur_o_pos: {} expected_end: {}", state.cur_o_pos, expected_end);
     }
 
@@ -315,10 +318,10 @@ impl RootInst {
 
     }
     fn max_u_trunc_amt(&self,max_space_avail:u32)->u32{
+        if max_space_avail >= self.len() || max_space_avail == 0 {return 0}
         match self{
             RootInst::Copy(copy) => copy.max_u_trunc_amt(max_space_avail),
-            RootInst::Add(a) => if a.len() <= max_space_avail {0} else {a.len() - max_space_avail},
-            RootInst::Run(a) => if a.len() <= max_space_avail {0} else {a.len() - max_space_avail},
+            a => a.len() - max_space_avail,
 
         }
     }
@@ -624,7 +627,7 @@ mod test_super {
         assert_eq!(output,answer);
     }
     #[test]
-    fn test_kitchen_sink(){ 
+    fn test_kitchen_sink(){
         //"hello" -> "hello world!" -> "Hello! Hello! Hello. hello. hello..."
         //we need to use a series of VCD_TARGET windows and Sequences across multiple patches
         //we should use copy/seq excessively since add/run is simple in the code paths.
