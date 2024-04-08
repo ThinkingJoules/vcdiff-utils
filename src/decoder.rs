@@ -18,7 +18,7 @@ impl DecInst{
             DecInst::Run(r) => r.len
         }) as usize
     }
-    pub fn len_in_t(&self, cur_u_pos:usize)->usize{
+    pub fn len_in_o(&self, cur_u_pos:usize)->usize{
         (match self{
             DecInst::Add(a) => a.len,
             DecInst::Copy(COPY { len, u_pos }) => {
@@ -134,7 +134,7 @@ impl<R: Read + Seek> VCDDecoder<R> {
                 }
                 self.addr_pos += read as u64;
                 let inst = DecInst::Copy(COPY { len: len as u32, u_pos: addr as u32 });
-                let len_t = inst.len_in_t(self.cur_u_position as usize) as u64;
+                let len_t = inst.len_in_o(self.cur_u_position as usize) as u64;
                 self.cur_u_position += len_t;
 
                 Some(inst)

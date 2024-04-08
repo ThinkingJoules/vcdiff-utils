@@ -94,11 +94,11 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                 for inst in [Some(first),second]{
                     if inst.is_none() {break;}
                     let inst = inst.unwrap();
-                    let len_in_t = inst.len_in_t(cur_u.len());
+                    let len_in_o = inst.len_in_o(cur_u.len());
                     match inst {
                         DecInst::Add(ADD{ p_pos,.. }) => {
                             let patch_r = decoder.reader().get_reader(p_pos)?;
-                            let mut slice = vec![0u8;len_in_t];
+                            let mut slice = vec![0u8;len_in_o];
                             patch_r.read_exact(&mut slice)?;
                             cur_u.append(&mut slice);
                             stats.add();
@@ -119,14 +119,14 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                                 let cur_u_ptr = cur_u.as_mut_ptr();
                                 let slice_ptr = cur_u.as_ptr();
                                 // Extend 'cur_u' with uninitialized memory, making it long enough
-                                cur_u.set_len(cur_u.len() + len_in_t);
+                                cur_u.set_len(cur_u.len() + len_in_o);
 
                                 // Copy data in a loop
                                 let mut amt_copied = 0;
-                                while amt_copied < len_in_t {
+                                while amt_copied < len_in_o {
                                     let (copy_len,source_offset) = if copy_end > cur_end {
                                         let seq_len = cur_end-u_pos;
-                                        let copy_len = std::cmp::min(len_in_t - amt_copied, seq_len);
+                                        let copy_len = std::cmp::min(len_in_o - amt_copied, seq_len);
                                         let seq_offset = amt_copied % seq_len;
                                         (copy_len,seq_offset+u_pos)
                                     } else{//regular copy
@@ -148,10 +148,10 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                         },
                         DecInst::Run(RUN{  byte, .. }) => {
                             stats.run();
-                            cur_u.extend(std::iter::repeat(byte).take(len_in_t));
+                            cur_u.extend(std::iter::repeat(byte).take(len_in_o));
                         },
                     }
-                    t_pos += len_in_t;
+                    t_pos += len_in_o;
                 }
             },
             VCDiffDecodeMsg::EndOfWindow => {
