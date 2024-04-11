@@ -1,6 +1,6 @@
 use std::{fmt::Debug, io::{Read,Seek,Write}, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{VCDReader, WinIndicator, WindowSummary}, translator::{gather_summaries, merge_ranges, range_overlap}, ADD, COPY, RUN};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_header, read_window_header, VCDReader, WinIndicator, WindowSummary}, ADD, COPY, RUN};
 #[derive(Debug,Default)]
 struct Stats{
     add: usize,
@@ -36,6 +36,50 @@ fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
     //sort with the smallest last
     ranges.sort_by(|a,b|b.start.cmp(&a.start));
     ranges
+}
+fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec<WindowSummary>>{
+    let header = read_header(patch_data)?;
+    let mut summaries = Vec::new();
+    let mut win_start_pos = header.encoded_size() as u64;
+    while let Ok(ws) = read_window_header(patch_data, win_start_pos) {
+        win_start_pos = ws.end_of_window();
+        summaries.push(ws);
+        patch_data.seek(std::io::SeekFrom::Start(win_start_pos))?;
+    }
+    Ok(summaries)
+}
+fn merge_ranges<T: Ord + Copy>(ranges: Vec<Range<T>>) -> Vec<Range<T>> {
+    let mut result: Vec<Range<T>> = Vec::new();
+    let mut sorted_ranges = ranges;
+
+    // 1. Sort the ranges by their start values
+    sorted_ranges.sort_by(|a, b| a.start.cmp(&b.start));
+
+    // 2. Iterate through the sorted ranges
+    for range in sorted_ranges {
+        // 3. If the result list is empty or the current range doesn't overlap
+        //    with the last range in the result, simply add it to the result.
+        if result.is_empty() || range.start > result.last().unwrap().end {
+            result.push(range);
+        } else {
+            // 4. Overlap exists: Extend the end of the last range in the result
+            //    to the maximum end of the overlapping ranges.
+            let last_index = result.len() - 1;
+            result[last_index].end = std::cmp::max(result[last_index].end, range.end);
+        }
+    }
+
+    result
+}
+fn range_overlap<T: Ord + Copy>(range1: &Range<T>, range2: &Range<T>) -> Option<Range<T>> {
+    let start = std::cmp::max(range1.start, range2.start);
+    let end = std::cmp::min(range1.end, range2.end);
+
+    if start < end {
+        Some(Range { start, end })
+    } else {
+        None
+    }
 }
 
 pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sink:&mut W) -> std::io::Result<()> {

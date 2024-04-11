@@ -136,8 +136,8 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx this will panic
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        let len = inst.len_in_t(self.cur_u_pos());
-        self.cur_t_size += len;
+        let inst_len = inst.len_in_o(self.cur_u_pos());
+        self.cur_t_size += inst_len;
         self.inst_buffer.push(op_code);
         self.encode_inst_to_buffers(inst, size, addr);
     }
@@ -150,7 +150,7 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx we do nothing
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        let inst_len = inst.len_in_t(self.cur_u_pos());
+        let inst_len = inst.len_in_o(self.cur_u_pos());
         let addr = if let EncInst::COPY(COPY { u_pos, .. }) = &inst {
             Some(self.caches.addr_encode(*u_pos as usize, self.cur_u_pos() as usize).0)
         } else { None };
@@ -282,7 +282,7 @@ pub enum EncInst{
 }
 
 impl EncInst {
-    fn len_in_t(&self,cur_u_pos:u32) -> u32 {
+    fn len_in_o(&self,cur_u_pos:u32) -> u32 {
         match self {
             EncInst::ADD(data) => data.len() as u32,
             EncInst::RUN(run) => run.len,
