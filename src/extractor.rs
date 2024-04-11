@@ -1,8 +1,8 @@
 
 
-use std::{io::{Read, Seek}, ops::Range};
+use std::{fmt::Debug, io::{Read, Seek}, num::NonZeroU32, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg::*}, reader::{VCDReader, WinIndicator}, ADD, COPY, RUN};
+use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg::*},reader::{VCDReader, WinIndicator}, ADD, COPY, RUN};
 
 ///Disassociated Copy (from the window it was found in).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,9 +27,21 @@ impl Instruction for DisCopy{
     fn skip(&mut self,amt:u32){
         self.u_pos += amt;
         self.len_u -= amt;
+        match self.copy_type{
+            CopyType::CopyQ{..} => {
+                panic!("CopyQ should not be skipped!");
+            },
+            _ => {}
+        }
     }
     fn trunc(&mut self,amt:u32){
         self.len_u = self.len_u - amt;
+        match self.copy_type{
+            CopyType::CopyQ{..} => {
+                panic!("CopyQ should not be truncated!");
+            },
+            _ => {}
+        }
     }
     fn inst_type(&self)->InstType {
         InstType::Copy{copy_type:self.copy_type,vcd_trgt:self.vcd_trgt}
@@ -56,7 +68,7 @@ impl CopyInst for DisCopy{
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CopyType{
     CopyS,
-    CopyT,
+    CopyT{inst_u_pos_start:u32},
     CopyQ{len_o:u32}
 }
 
@@ -65,7 +77,7 @@ impl CopyType {
         matches!(self, CopyType::CopyS)
     }
     pub fn in_t(&self)->bool{
-        matches!(self, CopyType::CopyT)
+        matches!(self, CopyType::CopyT{..})
     }
     pub fn is_seq(&self)->bool{
         matches!(self, CopyType::CopyQ{..})
@@ -86,7 +98,7 @@ impl Instruction for ExAdd{
         self.bytes = self.bytes.split_off(amt as usize);
     }
     fn trunc(&mut self,amt:u32){
-        self.bytes.truncate(amt as usize);
+        self.bytes.truncate(self.bytes.len() - amt as usize);
     }
     fn inst_type(&self)->InstType {
         InstType::Add
@@ -222,13 +234,13 @@ pub trait Instruction:Clone{
     fn trunc(&mut self,amt:u32);
     fn inst_type(&self)->InstType;
     fn src_range(&self)->Option<Range<u64>>;
-    fn will_fit_window(&self,max_space_avail:u32)->Option<u32>{
+    fn will_fit_window(&self,max_space_avail:NonZeroU32)->Option<NonZeroU32>{
         //can we figure out how much to truncate to fit in the space?
         match self.src_range(){
             None => {
                 //Add or Run
                 let cur_u_len = self.len_in_u();
-                if cur_u_len <= max_space_avail{
+                if cur_u_len <= max_space_avail.into(){
                     return None;
                 }else{
                     Some(max_space_avail)
@@ -238,10 +250,15 @@ pub trait Instruction:Clone{
                 //every change in len, also shrinks the sss
                 let cur_s_len = min.end - min.start;
                 let cur_u_len = self.len_in_u() + cur_s_len as u32;
-                if cur_u_len <= max_space_avail {
+                if cur_u_len <= max_space_avail.into() {
                     return None;
                 }else{
-                    Some(max_space_avail / 2)
+                    let new_len = max_space_avail.get() as u64 - cur_s_len;
+                    if new_len == 0{
+                        None
+                    }else{
+                        Some(NonZeroU32::new(new_len as u32).unwrap())
+                    }
                 }
             }
         }
@@ -249,15 +266,16 @@ pub trait Instruction:Clone{
     fn is_implicit_seq(&self)->bool{
         matches!(self.inst_type(), InstType::Copy{copy_type:CopyType::CopyQ{..},..})
     }
-    fn split_at(self,first_inst_len:u32)->(Self,Self){
+    fn split_at(mut self,first_inst_len:u32)->(Self,Self){
         assert!(!self.is_implicit_seq());
-        let mut first = self.clone();
         let mut second = self.clone();
-        first.trunc(self.len_in_u() - first_inst_len);
+        self.trunc(self.len_in_u() - first_inst_len);
         second.skip(first_inst_len);
-        (first,second)
+        (self,second)
     }
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InstType{
     Add,
     Run,
@@ -299,7 +317,7 @@ pub trait CopyInst:Instruction{
     fn min_src(&self)->Range<u64>{
         let new_ssp = self.ssp() + self.u_start_pos() as u64;
         let new_end = new_ssp + self.len_in_u() as u64;
-        new_ssp..std::cmp::min(new_end,self.sss() as u64)
+        new_ssp..std::cmp::min(new_end,new_ssp+self.sss() as u64)
     }
 }
 pub fn find_controlling_inst<I:PosInst>(insts:&[I],o_pos:u64)->Option<usize>{
@@ -319,8 +337,10 @@ pub fn find_controlling_inst<I:PosInst>(insts:&[I],o_pos:u64)->Option<usize>{
         None
     }
 }
-
-pub fn get_exact_slice<I:PosInst>(insts:&[I],start:u64,len:u32)->Option<Vec<I>>{
+pub(crate) fn sum_len<I:PosInst>(insts:&[I])->u64{
+    insts.iter().map(|i| i.len_in_o() as u64).sum()
+}
+pub fn get_exact_slice<I:PosInst+Debug>(insts:&[I],start:u64,len:u32)->Option<Vec<I>>{
     let start_idx = find_controlling_inst(insts,start)?;
     let end_pos = start + len as u64;
     let mut slice = Vec::new();
@@ -342,9 +362,11 @@ pub fn get_exact_slice<I:PosInst>(insts:&[I],start:u64,len:u32)->Option<Vec<I>>{
         slice.push(cur_inst);
 
         if cur_inst_end >= end_pos {
+
             break;
         }
     }
+    debug_assert!(sum_len(&slice)==len as u64,"{} != {} start:{} end_pos:{} ... {:?}",sum_len(&slice),len,start,end_pos,&slice);
     Some(slice)
 }
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -446,6 +468,7 @@ pub fn extract_patch_instructions<R:Read + Seek>(patch:R)->std::io::Result<(Vec<
                             let end_pos = u_pos + len;
                             //dbg!(end_pos,cur_u, len_u, sss, ssp);
                             let copy_type = if end_pos > cur_u{//seQ
+                                assert!(u_pos as u64 >= sss,"CopyT must be entirely in T!");
                                 let len_o = end_pos - cur_u;
                                 stats.copy_q(len_o as usize);
                                 CopyType::CopyQ{len_o}
@@ -453,9 +476,10 @@ pub fn extract_patch_instructions<R:Read + Seek>(patch:R)->std::io::Result<(Vec<
                                 stats.copy_s(len_u as usize);
                                 CopyType::CopyS
                             }else{//inT
-                                debug_assert!(len_u == len_o as u32);
+                                debug_assert!(len_u == len_o as u32,"Length Mismatch! Is this a seq?");
+                                assert!(u_pos as u64 >= sss,"CopyT must be entirely in T!");
                                 stats.copy_t(len_u as usize);
-                                CopyType::CopyT
+                                CopyType::CopyT{inst_u_pos_start:cur_u}
                             };
                             insts.push(VcdExtract{o_pos_start,inst:ExtractedInst::Copy(DisCopy{
                                 u_pos,

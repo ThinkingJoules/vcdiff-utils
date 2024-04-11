@@ -330,7 +330,7 @@ impl WindowSummary{
 }
 
 #[repr(u8)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy,Clone, Debug, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum WinIndicator {
     Neither = 0,

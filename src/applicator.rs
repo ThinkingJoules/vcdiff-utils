@@ -37,7 +37,7 @@ fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
     ranges.sort_by(|a,b|b.start.cmp(&a.start));
     ranges
 }
-fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec<WindowSummary>>{
+pub fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec<WindowSummary>>{
     let header = read_header(patch_data)?;
     let mut summaries = Vec::new();
     let mut win_start_pos = header.encoded_size() as u64;

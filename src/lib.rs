@@ -2,7 +2,6 @@
 pub mod reader;
 pub mod decoder;
 pub mod extractor;
-pub mod translator;
 pub mod merger;
 pub mod encoder;
 pub mod applicator;
