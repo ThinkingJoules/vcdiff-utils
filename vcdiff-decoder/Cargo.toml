@@ -1,9 +1,11 @@
 [package]
 name = "vcdiff-decoder"
-version = "0.1.0"
+description = "A pure Rust implementation for a VCDIFF decoder."
+license = "MIT"
+version = "1.0.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+keywords = ["vcdiff", "delta", "patch", "delta encoding", "delta compression"]
+categories = ["compression","encoding","decoding"]
 
 [dependencies]
 vcdiff-common ={ path = "../vcdiff-common"}
