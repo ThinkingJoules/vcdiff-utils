@@ -12,6 +12,7 @@ enum VCDiffState {
     EoF,
 }
 
+/// A reader for VCDIFF patches.
 #[derive(Debug)]
 pub struct VCDReader<R> {
     source: R,
@@ -56,17 +57,32 @@ impl<R: Read + Seek> VCDReader<R> {
 
         })
     }
+    /// Consumes the reader and returns the inner reader.
     pub fn into_inner(self)->R{
         self.source
     }
+    /// Seeks to the start of the window at the given position.
+    /// This is useful when you want to seek to a specific window in the patch. It allows you to 'rewind'. If needed.
+    /// This does not verify that the position is a valid window start.
+    /// # Arguments
+    /// * `win_start_pos` - The byte offset from the start of the patch file where the window starts.
     pub fn seek_to_window(&mut self,win_start_pos:u64){
         self.cur_pos = win_start_pos;
         self.cur_state = VCDiffState::EoW;
         self.moved = true; //let the next call seek
     }
+    /// Allows inner access to the reader in a controlled manner that will not mess up the reader's state.
+    /// This is useful when you need to read from the patch file directly.
+    /// # Arguments
+    /// * `from_start` - The byte offset from the start of the patch file where to start reading.
+    /// * `buf` - The buffer to read_exact into.
     pub fn read_from_src(&mut self,from_start:u64, buf:&mut [u8])->io::Result<()>{
         self.get_reader(from_start)?.read_exact(buf)
     }
+    /// Allows inner access to the reader in a controlled manner that will not mess up the reader's state.
+    /// This is useful when you need to read from the patch file directly.
+    /// # Arguments
+    /// * `at_from_start` - The byte offset from the start of the patch file for where to seek to.
     pub fn get_reader(&mut self,at_from_start:u64)->io::Result<&mut R>{
         self.moved = true;
         self.source.seek(io::SeekFrom::Start(at_from_start))?;
@@ -190,14 +206,13 @@ impl<R: Read + Seek> VCDReader<R> {
     ///This reads the next bytes as an integer.
     ///It does not verify that the reader is in the correct state.
     ///If used incorrectly, this will screw up the reader's state.
-    pub fn read_as_inst_size_unchecked(&mut self)->io::Result<u64>{
+    fn read_as_inst_size_unchecked(&mut self)->io::Result<u64>{
         self.resume()?;
         let (integer,len) = decode_integer(&mut self.source)?;
         self.cur_pos += len as u64;
         Ok(integer)
     }
     /// Reads the next segment from the VCDIFF patch, returning it as a `VCDiffMessage`.
-    /// If the end of the file is reached, `None` is returned.
     pub fn next(&mut self) -> io::Result<VCDiffReadMsg> {
         match self.cur_state {
             VCDiffState::Window { inst_sec_start, addr_sec_start, end_of_window,sss } => {
@@ -261,7 +276,7 @@ impl<R: Read + Seek> VCDReader<R> {
     }
 }
 
-
+/// Reads the fixed part of the VCDIFF patch file header.
 pub fn read_header<R: Read>(source: &mut R) -> io::Result<Header> {
     let mut buffer = [0; 4]; // Buffer to read the fixed header part.
     source.read_exact(&mut buffer)?;
@@ -310,6 +325,12 @@ pub fn read_header<R: Read>(source: &mut R) -> io::Result<Header> {
         code_table_data,
     })
 }
+/// Reads the window header from the VCDIFF patch file.
+/// To avoid the Seek trait we require the caller to tell us the current position of the reader.
+/// This way the caller can know that the reader can only read exactly the window header.
+/// # Arguments
+/// * `source` - The reader to read the window header from. Must be already positioned at the start of the window header.
+/// * `win_start_pos` - The byte offset from the start of the patch file where the window starts.
 pub fn read_window_header<R: Read>(source: &mut R, win_start_pos: u64) -> io::Result<WindowSummary>{
     let mut buffer = [0; 1];
     source.read_exact(&mut buffer)?;

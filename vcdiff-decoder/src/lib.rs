@@ -19,6 +19,7 @@ fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
     ranges.sort_by(|a,b|b.start.cmp(&a.start));
     ranges
 }
+///Gathers up all the window summaries in a patch file
 pub fn gather_summaries<R: Read + Seek>(patch_data:&mut R)-> std::io::Result<Vec<WindowSummary>>{
     let header = read_header(patch_data)?;
     let mut summaries = Vec::new();
@@ -63,7 +64,13 @@ fn range_overlap<T: Ord + Copy>(range1: &Range<T>, range2: &Range<T>) -> Option<
         None
     }
 }
-
+///Applies a VCDiff patch to a source buffer
+/// # Arguments
+/// * `patch` - A Read+Seek object that contains the VCDiff patch data
+/// * `src` - An optional mutable reference to a Read+Seek object that contains the source (dictionary) data
+/// * `sink` - A Write object that will receive the patched data
+/// # Errors
+/// Returns an error if there is an issue reading from the patch or source data, or writing to the sink
 pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<&mut R>,sink:&mut W) -> std::io::Result<()> {
     //to avoid the Read+Seek bound on sink,
     //we need to scan the whole patch file so we can cache the TargetSourced windows
@@ -225,7 +232,8 @@ impl Segment {
 }
 ///Sparse or Overlapping cache struct
 ///Used to spare parts of a src buffer that are needed, sparsely
-pub struct SparseCache
+///We can avoid the need for Read+Seek on the sink by caching the source data
+struct SparseCache
 {
     buffer: Vec<u8>,
     segment_map: Vec<Segment>,   // Maps (start, end) ranges of inner buffer to entries of K

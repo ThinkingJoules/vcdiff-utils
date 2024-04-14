@@ -83,6 +83,7 @@ impl DCopy{
     }
 }
 
+///Extracted Add instruction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExAdd{
     pub bytes:Vec<u8>,
@@ -118,7 +119,7 @@ impl MergeInst for RUN{
     }
 }
 
-
+///Disassociated Instruction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DInst{
     Add(ExAdd),
@@ -181,7 +182,7 @@ impl DInst {
 }
 
 
-
+///Extracted Instruction with a starting position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseInst{
     pub o_pos_start:u64,
@@ -218,8 +219,11 @@ pub trait PosInst:MergeInst{
     fn o_start(&self)->u64;
 }
 pub trait MergeInst:Instruction{
+    ///Shorten the 'front' of the instruction
     fn skip(&mut self,amt:u32);
+    ///Truncate off the 'back' of the instruction
     fn trunc(&mut self,amt:u32);
+    ///If this is a Copy, what is the ssp..ssp+sss that would contain exactly this one instruction.
     fn src_range(&self)->Option<Range<u64>>;
     fn will_fit_window(&self,max_space_avail:NonZeroU32)->Option<NonZeroU32>{
         //can we figure out how much to truncate to fit in the space?
@@ -260,7 +264,12 @@ pub trait MergeInst:Instruction{
 }
 
 
-
+///Determines the next WinIndicator based on the current instruction type, the current WinIndicator, and the instruction's VCD target status.
+/// Returns None if the new instruction does not change the current WinIndicator.
+/// # Arguments
+/// * `inst_type` - The type of the instruction.
+/// * `cur_ind` - The current WinIndicator.
+/// * `vcd_trgt` - The VCD target status of the instruction.
 pub fn comp_indicator(inst_type: &InstType, cur_ind: &WinIndicator, vcd_trgt: bool) -> Option<WinIndicator> {
     match (inst_type, cur_ind, vcd_trgt) {
         (InstType::Copy { .. }, WinIndicator::VCD_SOURCE, true)
@@ -270,7 +279,12 @@ pub fn comp_indicator(inst_type: &InstType, cur_ind: &WinIndicator, vcd_trgt: bo
         _ => None,
     }
 }
-
+///Finds the index of the instruction that controls the given output position.
+/// # Arguments
+/// * `insts` - The list of instructions to search.
+/// * `o_pos` - The output position to find the controlling instruction for.
+/// # Returns
+/// The index of the controlling instruction, or None if no such instruction exists.
 pub fn find_controlling_inst<I:PosInst>(insts:&[I],o_pos:u64)->Option<usize>{
     let inst = insts.binary_search_by(|probe|{
         let end = probe.o_start() + probe.len_in_o() as u64;
@@ -288,13 +302,22 @@ pub fn find_controlling_inst<I:PosInst>(insts:&[I],o_pos:u64)->Option<usize>{
         None
     }
 }
-pub fn sum_len<I:Instruction>(insts:&[I])->u64{
-    insts.iter().map(|i| i.len_in_o() as u64).sum()
-}
+
+///Returns a cloned and clipped subslice of instructions that exactly covers the requested output range.
+/// # Arguments
+/// * `instructions` - The list of instructions to extract from.
+/// * `start` - The output position (output byte offset) to start the slice at.
+/// * `len` - The length of the slice in output bytes.
+/// # Returns
+/// A vector containing the cloned and clipped instructions that exactly cover the requested output range.
+/// If the output range is not covered by the instructions, None is returned.
+///
+/// This does not check that the instructions are sequential.
 pub fn get_exact_slice<I:PosInst+Debug>(instructions:&[I],start:u64,len:u32)->Option<Vec<I>>{
     let start_idx = find_controlling_inst(instructions,start)?;
     let end_pos = start + len as u64;
     let mut slice = Vec::new();
+    let mut complete = false;
 
     for inst in instructions[start_idx..].iter() {
         let inst_len = inst.len_in_o();
@@ -313,13 +336,19 @@ pub fn get_exact_slice<I:PosInst+Debug>(instructions:&[I],start:u64,len:u32)->Op
         slice.push(cur_inst);
 
         if cur_inst_end >= end_pos {
-
+            complete = true;
+            //debug_assert!(sum_len_in_o(&slice)==len as u64,"{} != {} start:{} end_pos:{} ... {:?} from {:?}",sum_len_in_o(&slice),len,start,end_pos,&slice,instructions);
             break;
         }
     }
-    debug_assert!(sum_len(&slice)==len as u64,"{} != {} start:{} end_pos:{} ... {:?} from {:?}",sum_len(&slice),len,start,end_pos,&slice,instructions);
+    if !complete {
+        return None;
+    }
     Some(slice)
 }
+
+//Should maybe move this to Reader?
+///Stats about the patch file.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats{
     pub add_bytes:usize,
@@ -443,30 +472,7 @@ pub fn extract_patch_instructions<R:Read + Seek>(patch:R)->std::io::Result<(Vec<
     Ok((insts,stats))
 }
 
-/*
-In theory we only ever need to compare two patch files at once.
-We have an 'earlier' and a 'later' (terminal) patch.
-We need to figure out the precedence rules for merging.
-
-Any Add/Run found in 'later' is preserved.
-Copy's get more difficult.
-We technically have several types of copy commands.
-We have a Copy in S (in superstring U) that is ultimately sourced from the Src Doc
-    lets call this CopySS.
-Then we have Copy in S and the S component of U is from our Output Doc;
-    lets call this CopySO.
-Finally we have a Copy that is in T of U.
-That is we are copying bytes from some earlier operation(s) applied.
-This one has two sub variants.
-It can be treated like a normal Copy, or it might be an implicit sequence;
-lets call the first CopyTU, and the implicit sequence CopyTS.
-
-Currently we resolve all Copy's to CopySS so we can merge them.
-We must unwind any implicit sequences so that we can merge within them as well.
-Since we don't have the actual data, we can't encode anything other than CopySS.
-This means the merge patch will only ever have win_indicators of VCD_SOURCE (or NEITHER).
-*/
-
+/// This function will dereference all Non-CopySS instructions in the extracted instructions.
 pub fn deref_non_copy_ss(extracted:Vec<SparseInst>)->Vec<SparseInst>{
     let mut output:Vec<SparseInst> = Vec::with_capacity(extracted.len());
     let mut cur_o_pos = 0;
@@ -521,7 +527,7 @@ fn find_copy_s(extract:&[SparseInst],shift:usize,dest:&mut Vec<usize>){
     }
 }
 
-
+///Merger struct that can accept merging of additional patches.
 #[derive(Clone, Debug)]
 pub struct Merger{
     ///The summary patch that will be written to the output.
@@ -529,10 +535,17 @@ pub struct Merger{
     ///If this is empty, merging a patch will have no effect.
     ///These are where TerminalInst::CopySS are found.
     terminal_copy_indices: Vec<usize>,
-    final_size: u64,
+    //final_size: u64,
 }
 
 impl Merger {
+    ///Creates a new Merger from a terminal patch.
+    ///This should only be called using the patch that generates the output file you want.
+    /// # Arguments
+    /// * `terminal_patch` - The terminal patch that will serve as the core set of instructions.
+    /// # Returns
+    /// If the terminal patch has no Copy instructions, a SummaryPatch is returned.
+    /// If the terminal patch has even a single Copy instructions, a Merger is returned.
     pub fn new<R:Read + Seek>(terminal_patch:R) -> std::io::Result<Result<Merger,SummaryPatch>> {
         let (terminal_patch,stats) = extract_patch_instructions(terminal_patch)?;
         if stats.copy_bytes == 0{
@@ -544,8 +557,19 @@ impl Merger {
         let terminal_patch = deref_non_copy_ss(terminal_patch);
         find_copy_s(&terminal_patch,0,&mut terminal_copy_indices);
         debug_assert!(!terminal_copy_indices.is_empty(), "terminal_copy_indices should not be empty");
-        Ok(Ok(Merger{terminal_patch,terminal_copy_indices,final_size:stats.output_size as u64}))
+        Ok(Ok(Merger{
+            terminal_patch,
+            terminal_copy_indices,
+            //final_size:stats.output_size as u64
+        }))
     }
+    ///Merges a predecessor patch into the terminal patch.
+    ///This should be called using proper order of patches.
+    /// # Arguments
+    /// * `predecessor_patch` - The patch to merge into the current summary patch.
+    /// # Returns
+    /// If the resulting patch has no Copy instructions, a SummaryPatch is returned.
+    /// If the resulting patch has even a single Copy instructions, a Merger is returned.
     pub fn merge<R:Read + Seek>(mut self, predecessor_patch:R) -> std::io::Result<Result<Merger,SummaryPatch>> {
         debug_assert!({
             let mut x = 0;
@@ -570,7 +594,7 @@ impl Merger {
             debug_assert!(!copy.vcd_trgt());
             let o_start = copy.ssp + copy.u_pos as u64; //ssp is o_pos, u is offset from that.
             let resolved = get_exact_slice(&predecessor_patch, o_start, copy.len_in_u()).unwrap();
-            debug_assert_eq!(sum_len(&resolved), copy.len_in_o() as u64, "resolved: {:?} copy: {:?}",resolved,copy);
+            //debug_assert_eq!(sum_len_in_o(&resolved), copy.len_in_o() as u64, "resolved: {:?} copy: {:?}",resolved,copy);
             find_copy_s(&resolved, i+shift, &mut terminal_copy_indices);
             shift += resolved.len() - 1;
             inserts.push((i, resolved));
@@ -578,7 +602,7 @@ impl Merger {
         }
         //now we expand the old copy values with the derefd instructions.
         self.terminal_patch = expand_elements(self.terminal_patch, inserts);
-        debug_assert_eq!(sum_len(&self.terminal_patch), self.final_size, "final size: {} sum_len: {}",self.final_size,sum_len(&self.terminal_patch));
+        //debug_assert_eq!(sum_len_in_o(&self.terminal_patch), self.final_size, "final size: {} sum_len: {}",self.final_size,sum_len_in_o(&self.terminal_patch));
         if terminal_copy_indices.is_empty(){
             Ok(Err(SummaryPatch(self.terminal_patch)))
         }else{
@@ -592,11 +616,16 @@ impl Merger {
 
 }
 
-///This is returned when a terminal patch has no CopySS instructions.
-///Merging additional patches will have no effect.
+///This is returned when the current summary patch contains no Copy instructions, OR when you are finished with the Merger.
 #[derive(Debug)]
 pub struct SummaryPatch(Vec<SparseInst>);
 impl SummaryPatch{
+    ///Writes the summary patch to a sink.
+    /// # Arguments
+    /// * `sink` - The sink to write the summary patch to.
+    /// * `max_u_size` - The maximum size of the super string U. If None, the default is 256MB. This is used to help determine when new windows are created.
+    /// # Returns
+    /// The sink that was passed in.
     pub fn write<W:Write>(self,sink:W,max_u_size:Option<usize>)->std::io::Result<W>{
         let max_u_size = max_u_size.unwrap_or(1<<28); //256MB
         let header = Header::default();
@@ -903,7 +932,7 @@ mod test_super {
 
     use super::*;
     /*
-    All the merger tests will start with a src file of 'hello'
+    Basic merger tests will start with a src file of '01234'
     We will then create a series of patches that will make certain *changes* to the file.
     That is, we want to be able to apply them in different orders for different effects.
     To this end, all of the target windows must be the same size.

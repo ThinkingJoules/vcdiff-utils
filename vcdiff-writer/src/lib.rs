@@ -2,7 +2,7 @@ use std::io::Write;
 
 use vcdiff_common::{encode_integer, integer_encoded_size, Cache, CodeTableEntry, CopyType, DeltaIndicator, Header, InstType, Instruction, TableInst, WinIndicator, COPY, MAGIC, RUN, VCD_C_TABLE};
 
-
+///This is the main struct that will be used to write VCDIFF files.
 #[derive(Debug)]
 pub struct VCDWriter<W> {
     sink:W,
@@ -19,6 +19,7 @@ pub struct VCDWriter<W> {
 }
 
 impl<W: Write> VCDWriter<W> {
+    ///Creates a new VCDWriter with the given header and sink.
     pub fn new(mut sink: W, header:Header) -> std::io::Result<Self> {
         let Header { hdr_indicator, secondary_compressor_id, code_table_data } = header;
         if hdr_indicator != 0 || secondary_compressor_id.is_some() || code_table_data.is_some(){
@@ -194,17 +195,23 @@ impl<W: Write> VCDWriter<W> {
             },
         }
     }
+    ///This function will finish the current window and write it to the sink.
+    /// # Arguments
+    /// * `win_hdr` - The header for the next window window
     pub fn start_new_win(&mut self,win_hdr:WriteWindowHeader)-> std::io::Result<()> {
-        self.flush()?;
+        self.write_cur_window_to_sink()?;
         self.cur_win = Some(win_hdr);
         self.caches = Cache::new();
         Ok(())
     }
+    ///This will consume the writer and write the last window to the sink
+    /// # Returns
+    /// * The sink with the written data
     pub fn finish(mut self) -> std::io::Result<W> {
-        self.flush()?;
+        self.write_cur_window_to_sink()?;
         Ok(self.sink)
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn write_cur_window_to_sink(&mut self) -> std::io::Result<()> {
         for i in 0..3 {
             self.encode_insts(i);
         }
@@ -289,6 +296,7 @@ impl<W: Write> VCDWriter<W> {
     }
 }
 
+///These are the Instructions that must be given to the VCDWriter.
 #[derive(Clone, Debug,PartialEq, Eq)]
 pub enum WriteInst{
     ADD(Vec<u8>),
@@ -401,7 +409,7 @@ fn from_enc_inst_sec(inst:Option<&WriteInst>,mode:u8) -> TableInst {
 }
 
 
-
+///The window header that must be given to the VCDWriter to start a new window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteWindowHeader {
     pub win_indicator: WinIndicator,

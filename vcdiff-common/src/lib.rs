@@ -318,6 +318,7 @@ impl Cache {
         self.update(addr);
         res
     }
+    //TODO: Fix this, or where it is called in merger.
     pub fn peek_addr_encode(&self, addr: usize, here: usize) -> (u32, u8){
         assert!(addr < here,"addr can not be ahead of cur pos");
         return (addr as u32,0);
@@ -468,7 +469,8 @@ pub fn decode_integer<R: std::io::Read>(source: &mut R) -> std::io::Result<(u64,
     Ok((value,byte_count))
 }
 
-
+/// Encodes a u64 value into a variable-length base 128 integer per RFC 3284.
+/// The value is written to the provided sink.
 pub fn encode_integer<W: std::io::Write>(mut sink: W, mut value: u64) -> std::io::Result<()> {
     let mut bytes = [0u8; 10]; // Maximum size needed for a u64 value in base 128 encoding
     let mut index = bytes.len(); // Start from the end of the array
@@ -493,7 +495,7 @@ pub fn encode_integer<W: std::io::Write>(mut sink: W, mut value: u64) -> std::io
     // Write all the bytes at once, starting from the first used byte in the array
     sink.write_all(&bytes[index..])
 }
-
+/// The length of the give value when encoded as a base 128 integer per RFC 3284.
 pub fn integer_encoded_size(value: u64) -> usize {
     if value == 0 {
         return 1;
@@ -506,6 +508,11 @@ pub fn integer_encoded_size(value: u64) -> usize {
         value /= 128;
     }
     byte_count
+}
+
+/// Length in the output stream that the list of instructions will produce.
+pub fn sum_len_in_o<I:Instruction>(insts:&[I])->u64{
+    insts.iter().map(|i| i.len_in_o() as u64).sum()
 }
 
 

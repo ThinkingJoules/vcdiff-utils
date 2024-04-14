@@ -28,6 +28,7 @@ The vcdiff-utils workspace includes the following crates:
     - Only used for testing.
     - Tests against xdelta3 and Google's open-vcdiff lib.
 
-# Assumptions
+# Limitations
 - Maximum single instruction length is a u32::MAX
 - Maximum super string 'U' length is u32::MAX.
+- **Can only use the default code table**
