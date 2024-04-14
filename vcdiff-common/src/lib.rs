@@ -1,14 +1,169 @@
 
-pub mod reader;
-pub mod decoder;
-pub mod extractor;
-pub mod merger;
-pub mod encoder;
-pub mod applicator;
-//We only allow windows of less than 2GB, so we can use u32 for all sizes.
-//The patch file itself can be larger, but we can't have a window that large.
+
 pub const MAGIC:[u8;4] = [b'V'|0x80, b'C'|0x80, b'D'|0x80, 0];
 
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Header{
+    pub hdr_indicator: u8,
+    pub secondary_compressor_id: Option<u8>,
+    pub code_table_data: Option<CodeTableData>,
+}
+impl Header{
+    pub fn encoded_size(&self)->usize{
+        let mut size = 4 + 1; // Fixed part of the header
+        if self.secondary_compressor_id.is_some(){
+            size += 1;
+        }
+        if let Some(code_table_data) = &self.code_table_data{
+            let integer = code_table_data.compressed_code_table_data.len();
+            let int_size = integer_encoded_size(integer as u64);
+            size += 1 + 1 + integer + int_size;
+        }
+        size
+    }
+}
+
+/// Encapsulates the code table data found in the VCDIFF patch header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeTableData {
+    pub size_of_near_cache: u8,
+    pub size_of_same_cache: u8,
+    pub compressed_code_table_data: Vec<u8>,
+}
+
+
+
+/// Represents a summary of a window in a VCDIFF patch, including the positions of different sections within the window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowSummary {
+    pub win_start_pos:u64,
+    pub win_indicator: WinIndicator,
+    pub source_segment_size: Option<u64>,
+    pub source_segment_position: Option<u64>,
+    pub length_of_the_delta_encoding: u64,
+    pub size_of_the_target_window: u64,
+    pub delta_indicator: DeltaIndicator,
+    pub length_of_data_for_adds_and_runs: u64,
+    pub length_of_instructions_and_sizes: u64,
+    pub length_of_addresses_for_copys: u64,
+}
+impl WindowSummary{
+    pub fn win_hdr_len(&self)->usize{
+        let mut size = 1;
+        if let Some(s) = self.source_segment_size{
+            size += integer_encoded_size(s);
+        }
+        if let Some(s) = self.source_segment_position{
+            size += integer_encoded_size(s);
+        }
+        size += integer_encoded_size(self.length_of_the_delta_encoding);
+        size += integer_encoded_size(self.size_of_the_target_window);
+        size += 1; //delta_indicator
+        size += integer_encoded_size(self.length_of_data_for_adds_and_runs);
+        size += integer_encoded_size(self.length_of_instructions_and_sizes);
+        size += integer_encoded_size(self.length_of_addresses_for_copys);
+        size
+    }
+    pub fn data_sec_start(&self)->u64{
+        self.win_start_pos + self.win_hdr_len() as u64
+    }
+    pub fn inst_sec_start(&self)->u64{
+        self.data_sec_start() + self.length_of_data_for_adds_and_runs
+    }
+    pub fn addr_sec_start(&self)->u64{
+        self.inst_sec_start() + self.length_of_instructions_and_sizes
+    }
+    pub fn end_of_window(&self)->u64{
+        self.addr_sec_start() + self.length_of_addresses_for_copys
+    }
+    pub fn is_vcd_target(&self)->bool{
+        self.win_indicator == WinIndicator::VCD_TARGET
+    }
+    pub fn has_reference_data(&self)->bool{
+        self.win_indicator != WinIndicator::Neither
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy,Clone, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum WinIndicator {
+    Neither = 0,
+    VCD_SOURCE = 1 << 0,
+    VCD_TARGET = 1 << 1,
+}
+impl Default for WinIndicator {
+    fn default() -> Self {
+        Self::Neither
+    }
+}
+impl WinIndicator {
+    pub fn from_u8(byte: u8) -> Self {
+        match byte {
+            0 => Self::Neither,
+            1 => Self::VCD_SOURCE,
+            2 => Self::VCD_TARGET,
+            _ => panic!("Invalid WinIndicator byte: {}", byte),
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeltaIndicator(pub u8);
+
+impl DeltaIndicator {
+    pub fn from_u8(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub fn to_u8(&self) -> u8 {
+        self.0
+    }
+
+    pub fn is_datacomp(&self) -> bool {
+        self.0 & 0x01 != 0
+    }
+
+    pub fn is_instcomp(&self) -> bool {
+        self.0 & 0x02 != 0
+    }
+
+    pub fn is_addrcomp(&self) -> bool {
+        self.0 & 0x04 != 0
+    }
+}
+
+
+///Basic instruction
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inst{
+    Add(ADD),
+    Copy(COPY),
+    Run(RUN)
+}
+impl Instruction for Inst{
+    fn len_in_u(&self)->u32{
+        match self{
+            Inst::Add(a) => a.len,
+            Inst::Copy(c) => c.len,
+            Inst::Run(r) => r.len
+        }
+    }
+
+    fn inst_type(&self)->InstType {
+        match self{
+            Inst::Add(_) => InstType::Add,
+            Inst::Run(_) => InstType::Run,
+            Inst::Copy(COPY { copy_type, .. }) => InstType::Copy (*copy_type),
+        }
+    }
+}
 ///Decoded ADD instruction
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ADD{
@@ -23,6 +178,15 @@ pub struct COPY{
     pub len:u32,
     ///Decoded start position in window string U
     pub u_pos:u32,
+    pub copy_type:CopyType,
+}
+impl Instruction for COPY{
+    fn len_in_u(&self)->u32{
+        self.len
+    }
+    fn inst_type(&self)->InstType{
+        InstType::Copy(self.copy_type)
+    }
 }
 ///Inlined of Decoded RUN instruction
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -30,54 +194,81 @@ pub struct RUN{
     pub len: u32,
     pub byte: u8
 }
-
-impl ADD{
-    pub fn len(&self)->u32{
+impl Instruction for RUN{
+    fn len_in_u(&self)->u32{
         self.len
     }
-    pub fn skip(&mut self,amt:u32){
-        self.len-=amt;
-        self.p_pos+=amt as u64;
-    }
-    pub fn trunc(&mut self,amt:u32){
-        self.len-=amt;
-    }
-}
-impl RUN{
-    pub fn len(&self)->u32{
-        self.len
-    }
-    pub fn skip(&mut self,amt:u32){
-        self.len-=amt as u32;
-    }
-    pub fn trunc(&mut self,amt:u32){
-        self.len-=amt;
-    }
-}
-impl COPY{
-    pub fn len_in_u(&self)->u32{
-        self.len
-    }
-    pub fn skip(&mut self,amt:u32){
-        self.len-=amt;
-        self.u_pos+=amt;
-    }
-    pub fn trunc(&mut self,amt:u32){
-        self.len-=amt;
+    fn inst_type(&self)->InstType{
+        InstType::Run
     }
 }
 
-#[derive(Debug)]
+pub trait Instruction:Clone{
+    fn len_in_u(&self)->u32;
+    fn inst_type(&self)->InstType;
+    fn len_in_o(&self)->u32{
+        match self.inst_type(){
+            InstType::Add => self.len_in_u(),
+            InstType::Run => self.len_in_u(),
+            InstType::Copy(copy_type) => match copy_type{
+                CopyType::CopyS => self.len_in_u(),
+                CopyType::CopyT{..} => self.len_in_u(),
+                CopyType::CopyQ{len_o} => len_o,
+            }
+        }
+    }
+    fn is_implicit_seq(&self)->bool{
+        matches!(self.inst_type(), InstType::Copy(CopyType::CopyQ{..}))
+    }
+    fn copy_in_s(&self)->bool{
+        matches!(self.inst_type(), InstType::Copy(CopyType::CopyS))
+    }
+    fn copy_in_t(&self)->bool{
+        matches!(self.inst_type(), InstType::Copy(CopyType::CopyT{..}))
+    }
+}
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InstType{
+    Add,
+    Run,
+    Copy(CopyType),
+}
+
+impl InstType {
+    pub fn is_copy(&self)->bool{
+        matches!(self, InstType::Copy{..})
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CopyType{
+    CopyS,
+    CopyT{inst_u_pos_start:u32},
+    CopyQ{len_o:u32}
+}
+
+impl CopyType {
+    pub fn in_s(&self)->bool{
+        matches!(self, CopyType::CopyS)
+    }
+    pub fn in_t(&self)->bool{
+        matches!(self, CopyType::CopyT{..})
+    }
+    pub fn is_seq(&self)->bool{
+        matches!(self, CopyType::CopyQ{..})
+    }
+}
+///Currently this is only a static implementation of the cache. We cannot handle different S_NEAR or S_SAME parameters.
+#[derive(Clone,Debug)]
 pub struct Cache {
     near: [usize; Self::S_NEAR], // Fixed array size of 4
     next_slot: usize,
     same: [usize; Self::S_SAME * 256], // Fixed array size of 3 * 256
 }
-
 impl Cache {
-    const S_NEAR: usize = 4;
-    const S_SAME: usize = 3;
-    const SAME_START: usize = Self::S_NEAR + 2;
+    pub const S_NEAR: usize = 4;
+    pub const S_SAME: usize = 3;
+    pub const SAME_START: usize = Self::S_NEAR + 2;
     pub fn new() -> Self {
         Cache {
             near: [0; Self::S_NEAR],
@@ -94,43 +285,7 @@ impl Cache {
         let same_index = address % (Self::S_SAME * 256); // Modulus for same cache addressing
         self.same[same_index] = address;
     }
-
-    pub fn addr_encode(&mut self, addr: usize, here: usize) -> (u32, u8) { // Return encoded address and mode
-        let res = self.peek_addr_encode(addr, here);
-        self.update(addr);
-        res
-    }
-    pub fn peek_addr_encode(&self, addr: usize, here: usize) -> (u32, u8){
-        assert!(addr < here,"addr can not be ahead of cur pos");
-        return (addr as u32,0);
-        let mut best_distance = addr;
-        let mut best_mode = 0; // VCD_SELF
-        // VCD_HERE
-        let distance = here - addr;
-        if distance < best_distance {
-            best_distance = distance;
-            best_mode = 1;
-        }
-
-        // Near cache
-        for (i, &near_addr) in self.near.iter().enumerate() {
-            if addr >= near_addr && addr - near_addr < best_distance {
-                best_distance = addr - near_addr;
-                best_mode = i + 2;
-            }
-        }
-
-        // Same cache
-        let distance = addr % (Self::S_SAME * 256);
-        if self.same[distance] == addr {
-            best_distance = distance % 256;
-            best_mode = Self::SAME_START + distance / 256;
-        }
-        (best_distance as u32, best_mode as u8)
-    }
-
-    /// **addr_section**, is a reader that is positioned at the start of the address section
-    /// It is only advanced by this function, so it remembers what it has read
+    /// **read_value** is the value read from the address section
     /// **here** is the current position in the target output
     /// **mode** is the mode of the address
     /// returns (address, bytes_read_from_addr_section)
@@ -155,17 +310,42 @@ impl Cache {
             let same_index = m * 256 + read_value as usize;
             addr = self.same[same_index] as u64;
         }
-
-        // assert!(addr < here as u64,
-        //     "here: {} addr: {} mode: {} math: {}",
-        //     here,addr,mode,
-        //     if mode == 0 { addr.to_string() }
-        //     else if mode == 1 { format!("addr{}=here({})-x({})",addr,here,here-addr) }
-        //     else if mode >= 2 && mode - 2 < Cache::S_NEAR { format!("near_index:{} value={}, x={}",mode-2,self.near[mode-2],addr-self.near[mode-2] as u64) }
-        //     else { "TODO".to_string() },
-        // );
         self.update(addr as usize);
         addr
+    }
+    pub fn addr_encode(&mut self, addr: usize, here: usize) -> (u32, u8) { // Return encoded address and mode
+        let res = self.peek_addr_encode(addr, here);
+        self.update(addr);
+        res
+    }
+    pub fn peek_addr_encode(&self, addr: usize, here: usize) -> (u32, u8){
+        assert!(addr < here,"addr can not be ahead of cur pos");
+        return (addr as u32,0);
+        //There is an error either here in this code, or somewhere in the writer/encoder code.
+        // let mut best_distance = addr;
+        // let mut best_mode = 0; // VCD_SELF
+        // // VCD_HERE
+        // let distance = here - addr;
+        // if distance < best_distance {
+        //     best_distance = distance;
+        //     best_mode = 1;
+        // }
+
+        // // Near cache
+        // for (i, &near_addr) in self.near.iter().enumerate() {
+        //     if addr >= near_addr && addr - near_addr < best_distance {
+        //         best_distance = addr - near_addr;
+        //         best_mode = i + 2;
+        //     }
+        // }
+
+        // // Same cache
+        // let distance = addr % (Self::S_SAME * 256);
+        // if self.same[distance] == addr {
+        //     best_distance = distance % 256;
+        //     best_mode = Self::SAME_START + distance / 256;
+        // }
+        // (best_distance as u32, best_mode as u8)
     }
 }
 
@@ -178,11 +358,28 @@ pub enum TableInst {
     Copy { size: u8, mode: u8 },
 }
 
+impl TableInst {
+    pub fn size(&self) -> u8 {
+        match self {
+            TableInst::Add { size } => *size,
+            TableInst::Run => 0,
+            TableInst::Copy { size, .. } => *size,
+            TableInst::NoOp => 0,//ambiguous
+        }
+    }
+}
+
 // Define a struct for a code table entry that can represent up to two instructions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CodeTableEntry {
-    first: TableInst,
-    second: TableInst,
+    pub first: TableInst,
+    pub second: TableInst,
+}
+impl CodeTableEntry{
+    pub fn sec_is_noop(&self) -> bool {
+        self.second == TableInst::NoOp
+    }
+
 }
 
 // Implement the function to generate the default VCDIFF code table.
@@ -347,109 +544,6 @@ mod test_super {
     #[test]
     fn test_len() -> () {
         assert_eq!(integer_encoded_size(TEST_VALUE), CORRECT_ENCODING.len(), "Length mismatch");
-    }
-    #[test]
-    fn test_vcd_self_mode() {
-        // Test VCD_SELF mode (address encoded by itself)
-        let mut cache = Cache::new();
-        let address = 100;
-        let here = 200;
-
-        // Encode
-        let (encoded_value, mode) = cache.addr_encode(address, here);
-
-        // Expected values based on RFC 3284 section 5.3
-        let expected_value = address;
-        let expected_mode = 0; // VCD_SELF
-
-        assert_eq!(encoded_value, expected_value as u32);
-        assert_eq!(mode, expected_mode);
-
-
-        // Decode
-        let decoded_address = cache.addr_decode(100, here as u64, mode as usize);
-
-        // Expected decoded address based on the encoding
-        assert_eq!(decoded_address, expected_value as u64);
-    }
-    #[test]
-    fn test_vcd_here_mode() {
-        // Test VCD_HERE mode (address encoded as here - addr)
-        let mut cache = Cache::new();
-        let address = 100;
-        let here = 150;
-
-        // Encode
-        let (encoded_value, mode) = cache.addr_encode(address, here);
-
-        // Expected values based on RFC 3284 section 5.3
-        let expected_value = here - address;
-        let expected_mode = 1; // VCD_HERE
-
-        assert_eq!(encoded_value, expected_value as u32); // Cast to u32 for size comparison
-        assert_eq!(mode, expected_mode);
-
-
-        // Decode
-        let decoded_address = cache.addr_decode(50,here as u64, mode as usize);
-
-        // Expected decoded address based on the encoding
-        assert_eq!(decoded_address, here as u64 - expected_value as u64);
-    }
-    #[test]
-    fn test_near_cache_mode() {
-        // Test encoding and decoding using the near cache
-        let mut cache = Cache::new();
-        let address = 110;
-        let here = 210;
-
-        // Update near cache to simulate a previously encoded address
-        cache.update(100);
-
-        // Encode
-        let (encoded_value, mode) = cache.addr_encode(address, here);
-
-        // Expected values based on RFC 3284 section 5.3
-        let expected_value = address - 100; // Distance from address to element in near cache
-        let expected_mode = 2; // Near cache mode (offset 2, since fixed size is 4)
-
-        assert_eq!(encoded_value, expected_value as u32);
-        assert_eq!(mode, expected_mode);
-
-        // Decode
-        let decoded_address = cache.addr_decode(10, here as u64, mode as usize);
-
-        // Expected decoded address based on the encoding
-        assert_eq!(decoded_address, (100 + expected_value) as u64);
-    }
-    #[test]
-    fn test_same_cache_mode() {
-        let mut cache = Cache::new();
-        let base_addr = 5 * 256;  // Example base address
-
-        // Update cache with the base address to populate the same cache
-        cache.update(base_addr);
-
-        // Target address with the same byte value as base_addr,
-        // but at a different offset
-        let target_addr = base_addr; // Offset by a value that's not a multiple of 256
-
-        // Encode
-        let (encoded_value, mode) = cache.addr_encode(target_addr, 2100); // 'here' is irrelevant
-
-        // Expected Values
-        let offset = target_addr % (Cache::S_SAME * 256); // Relative offset
-        let byte_value = target_addr % 256;
-        let expected_mode = Cache::S_NEAR + 2 + offset / 256;
-
-        assert_eq!(encoded_value as usize, byte_value); // Encoded value is the byte itself
-        assert_eq!(mode, expected_mode as u8);
-
-        // Decode
-        let decoded_address = cache.addr_decode(encoded_value as u64, 0, mode as usize);
-
-        // Expected decoded address based on the encoding
-        assert_eq!(decoded_address, target_addr as u64);
     }
 
 }

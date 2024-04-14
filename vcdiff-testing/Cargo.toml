@@ -1,13 +1,14 @@
 [package]
-name = "testing"
+name = "vcdiff-testing"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-blake3 = "1.5.1"
-reqwest = {version = "0.12.2", features = ["blocking"]}
+vcdiff-decoder ={ path = "../vcdiff-decoder"}
+vcdiff-merger ={ path = "../vcdiff-merger"}
 open-vcdiff-rs-bindings = {path = "../../open-vcdiff-rs-bindings"}
-vcdiff-merge = { path = "../" }
+blake3 = "1.5.1"
 xdelta3 = { git = "https://github.com/yjh0502/xdelta3-rs", rev = "5e1341452e2aac220af761aaea4ea3ca95f1be26"}
+reqwest = {version = "0.12.2", features = ["blocking"]}

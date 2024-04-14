@@ -1,27 +1,9 @@
 use std::{fmt::Debug, io::{Read,Seek,Write}, ops::Range};
 
-use crate::{decoder::{DecInst, VCDDecoder, VCDiffDecodeMsg}, reader::{read_header, read_window_header, VCDReader, WinIndicator, WindowSummary}, ADD, COPY, RUN};
-#[derive(Debug,Default)]
-struct Stats{
-    add: usize,
-    copy: usize, //non-implicit sequence copys
-    run: usize,
-    seq: usize, //implicit sequence copys
-}
-impl Stats{
-    fn add(&mut self){
-        self.add += 1;
-    }
-    fn copy(&mut self){
-        self.copy += 1;
-    }
-    fn run(&mut self){
-        self.run += 1;
-    }
-    fn seq(&mut self){
-        self.seq += 1;
-    }
-}
+use vcdiff_common::{CopyType, Inst, Instruction, WinIndicator, WindowSummary, ADD, COPY, RUN};
+use vcdiff_reader::{read_header, read_window_header, VCDReader, VCDiffReadMsg};
+
+
 
 fn find_dep_ranges(summaries: &[WindowSummary])->Vec<Range<u64>>{
     let mut ranges = Vec::new();
@@ -82,25 +64,24 @@ fn range_overlap<T: Ord + Copy>(range1: &Range<T>, range2: &Range<T>) -> Option<
     }
 }
 
-pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sink:&mut W) -> std::io::Result<()> {
+pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<&mut R>,sink:&mut W) -> std::io::Result<()> {
     //to avoid the Read+Seek bound on sink,
     //we need to scan the whole patch file so we can cache the TargetSourced windows
     let windows = gather_summaries(patch)?;
     let dependencies = find_dep_ranges(&windows);
-    let reader = VCDReader::new(patch)?;
-    let mut decoder = VCDDecoder::new(reader);
+    let mut reader = VCDReader::new(patch)?;
     let mut ws = None;
     let mut cur_u = Vec::new();
     let mut sink_cache = SparseCache::new();
     let mut o_pos = 0;
     let mut t_pos = 0;
 
-    let mut stats = Stats::default();
+    //let mut stats = Stats::default();
 
     loop{
-        let msg = decoder.next()?;
+        let msg = reader.next()?;
         match msg{
-            VCDiffDecodeMsg::WindowSummary(w) => {
+            VCDiffReadMsg::WindowSummary(w) => {
                 let WindowSummary{
                     win_indicator,
                     source_segment_size,
@@ -113,7 +94,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                     },
                     _ => *size_of_the_target_window,
                 } as usize;
-                stats = Stats::default();
+                //stats = Stats::default();
                 debug_assert!(cur_u.is_empty());
                 if cur_u.capacity() < needed_capacity {
                     cur_u.reserve(needed_capacity - cur_u.capacity());
@@ -134,30 +115,30 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                 }
                 ws = Some(w)
             },
-            VCDiffDecodeMsg::Inst { first, second, .. } => {
+            VCDiffReadMsg::Inst { first, second, .. } => {
                 for inst in [Some(first),second]{
                     if inst.is_none() {break;}
                     let inst = inst.unwrap();
-                    let len_in_o = inst.len_in_o(cur_u.len());
+                    let len_in_o = inst.len_in_o() as usize;
                     match inst {
-                        DecInst::Add(ADD{ p_pos,.. }) => {
-                            let patch_r = decoder.reader().get_reader(p_pos)?;
+                        Inst::Add(ADD{ p_pos,.. }) => {
+                            let patch_r = reader.get_reader(p_pos)?;
                             let mut slice = vec![0u8;len_in_o];
                             patch_r.read_exact(&mut slice)?;
                             cur_u.append(&mut slice);
-                            stats.add();
+                            //stats.add();
                         },
-                        DecInst::Copy(COPY{  u_pos, len:copy_in_u }) => {
+                        Inst::Copy(COPY{  u_pos, len:copy_in_u,copy_type }) => {
                             let u_pos = u_pos as usize;
                             //first figure out if this is an implicit sequence
                             let cur_end = cur_u.len();
-                            let copy_end = u_pos + copy_in_u as usize;
+                            //let copy_end = u_pos + copy_in_u as usize;
                             debug_assert!(u_pos < cur_end,"{:?} >= {:?}",u_pos,cur_end);
-                            if copy_end > cur_end {
-                                stats.seq();
-                            }else{
-                                stats.copy();
-                            }
+                            // if copy_end > cur_end {
+                            //     stats.seq();
+                            // }else{
+                            //     stats.copy();
+                            // }
                             unsafe{
                                 // Get raw pointers
                                 let cur_u_ptr = cur_u.as_mut_ptr();
@@ -168,7 +149,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                                 // Copy data in a loop
                                 let mut amt_copied = 0;
                                 while amt_copied < len_in_o {
-                                    let (copy_len,source_offset) = if copy_end > cur_end {
+                                    let (copy_len,source_offset) = if matches!(copy_type,CopyType::CopyQ { .. }) {
                                         let seq_len = cur_end-u_pos;
                                         let copy_len = std::cmp::min(len_in_o - amt_copied, seq_len);
                                         let seq_offset = amt_copied % seq_len;
@@ -190,15 +171,15 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                                 }
                             }
                         },
-                        DecInst::Run(RUN{  byte, .. }) => {
-                            stats.run();
+                        Inst::Run(RUN{  byte, .. }) => {
+                            //stats.run();
                             cur_u.extend(std::iter::repeat(byte).take(len_in_o));
                         },
                     }
                     t_pos += len_in_o;
                 }
             },
-            VCDiffDecodeMsg::EndOfWindow => {
+            VCDiffReadMsg::EndOfWindow => {
                 //check dependencies for ranges
                 //copy value in U (in T) to the SparseCache
                 //our dependencies can be across window boundaries
@@ -222,7 +203,7 @@ pub fn apply_patch<R:Read+Seek+Debug,W:Write>(patch:&mut R,mut src:Option<R>,sin
                 sink.write_all(&cur_u[t_start..t_start+t_len as usize])?;
                 cur_u.clear();
             },
-            VCDiffDecodeMsg::EndOfFile => break,
+            VCDiffReadMsg::EndOfFile => break,
         }
         //dbg!(&cur_u);
     }
@@ -408,6 +389,28 @@ pub(crate) fn find_intersections<T: Ord + Copy>(reference_set: &Range<T>, test_s
 
     intersections
 }
+// ///Used for debugging
+// #[derive(Debug,Default)]
+// struct Stats{
+//     add: usize,
+//     copy: usize, //non-implicit sequence copys
+//     run: usize,
+//     seq: usize, //implicit sequence copys
+// }
+// impl Stats{
+//     fn add(&mut self){
+//         self.add += 1;
+//     }
+//     fn copy(&mut self){
+//         self.copy += 1;
+//     }
+//     fn run(&mut self){
+//         self.run += 1;
+//     }
+//     fn seq(&mut self){
+//         self.seq += 1;
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -416,7 +419,7 @@ mod tests {
     #[test]
     fn test_src_apply(){
         // "hello" -> "Hello! Hello!"
-        let src = Cursor::new("hello".as_bytes().to_vec());
+        let mut src = Cursor::new("hello".as_bytes().to_vec());
 
         //from encoder tests
         let patch = vec![
@@ -439,13 +442,13 @@ mod tests {
         ];
         let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(&mut src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello!".as_bytes());
     }
     #[test]
     fn test_complex_apply(){
         // "hello" -> "Hello! Hello!"
-        let src = Cursor::new("hello".as_bytes().to_vec());
+        let mut src = Cursor::new("hello".as_bytes().to_vec());
 
         //from encoder tests
         let patch = vec![
@@ -488,14 +491,14 @@ mod tests {
         ];
         let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(&mut src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello!".as_bytes());
     }
 
     #[test]
     fn test_kitchen_sink(){
         // "hello" -> "Hello! Hello! Hell..."
-        let src = Cursor::new("hello".as_bytes().to_vec());
+        let mut src = Cursor::new("hello".as_bytes().to_vec());
 
         //from encoder tests
         let patch = vec![
@@ -554,7 +557,7 @@ mod tests {
         ];
         let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(&mut src),&mut sink).unwrap();
         assert_eq!(sink, "Hello! Hello! Hell...".as_bytes());
 
     }
@@ -562,7 +565,7 @@ mod tests {
 #[test]
     fn test_kitchen_sink2(){
         // "hello world!" -> "Hello! Hello! Hello. "
-        let src = Cursor::new("hello world!".as_bytes().to_vec());
+        let mut src = Cursor::new("hello world!".as_bytes().to_vec());
 
         //from encoder tests
         let patch = vec![
@@ -578,35 +581,36 @@ mod tests {
             5, //length of instructions and size
             3, //length of addr
             72, //data section 'H'
-            235, //ADD1 COPY4_mode6
-            35, //COPY0_mode1
+            163, //ADD1 COPY4_mode0
+            19, //COPY0_mode0
             1, //..size
             19, //COPY0_mode0
             1, //..size
             0, //addr 0
-            6, //addr 1
+            10, //addr 1
             4, //addr 2
             2, //win_indicator VCD_TARGET
             7, //SSS
             0, //SSP
-            13, //delta window size
+            14, //delta window size
             14, //target window size
             0, //delta indicator
             1, //length of data for ADDs and RUN/
             5, //length of instructions and size
-            2, //length of addr
+            3, //length of addr
             46, //data section '.'
-            115, //COPY0_mode6 noop
-            19, //..size
+            23, //COPY0_mode0 noop
+            28, //..size
             2, //Add1 NOOP
-            35, //COPY0_mode1
+            19, //COPY0_mode0
             1, //..size
             0, //addr 0
             7, //addr 1
+            13, //addr 2
         ];
         let mut patch = Cursor::new(patch);
         let mut sink = Vec::new();
-        apply_patch(&mut patch,Some(src),&mut sink).unwrap();
+        apply_patch(&mut patch,Some(&mut src),&mut sink).unwrap();
         let str = std::str::from_utf8(&sink).unwrap();
         assert_eq!(str, "Hello! Hello! Hello. ");
 

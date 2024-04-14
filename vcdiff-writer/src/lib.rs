@@ -1,24 +1,24 @@
 use std::io::Write;
 
-use crate::{encode_integer, integer_encoded_size, reader::{DeltaIndicator, Header, WinIndicator}, Cache, CodeTableEntry, TableInst, COPY, MAGIC, RUN, VCD_C_TABLE};
+use vcdiff_common::{encode_integer, integer_encoded_size, Cache, CodeTableEntry, CopyType, DeltaIndicator, Header, InstType, Instruction, TableInst, WinIndicator, COPY, MAGIC, RUN, VCD_C_TABLE};
 
 
 #[derive(Debug)]
-pub struct VCDEncoder<W> {
+pub struct VCDWriter<W> {
     sink:W,
     caches: Cache,
     //circular buffer of last 3 instructions
-    buffer: [Option<EncInst>;3],
+    buffer: [Option<WriteInst>;3],
     //should keep increasing. Value points to the index to write to (mod 3)
     buffer_pos: usize,
     data_buffer: Vec<u8>,
     inst_buffer: Vec<u8>,
     addr_buffer: Vec<u8>,
-    cur_win:Option<WindowHeader>,
+    cur_win:Option<WriteWindowHeader>,
     cur_t_size:u32,
 }
 
-impl<W: Write> VCDEncoder<W> {
+impl<W: Write> VCDWriter<W> {
     pub fn new(mut sink: W, header:Header) -> std::io::Result<Self> {
         let Header { hdr_indicator, secondary_compressor_id, code_table_data } = header;
         if hdr_indicator != 0 || secondary_compressor_id.is_some() || code_table_data.is_some(){
@@ -27,7 +27,7 @@ impl<W: Write> VCDEncoder<W> {
         sink.write_all(&MAGIC)?;
         sink.write_all(&[hdr_indicator])?;
 
-        Ok(VCDEncoder {
+        Ok(VCDWriter {
             sink,
             caches: Cache::new(),
             buffer: [None,None,None],
@@ -52,7 +52,7 @@ impl<W: Write> VCDEncoder<W> {
     }
     ///This will take in a new instruction and attempt to merge it with the last instruction
     ///If it cannot be merged, it will be added to the unwritten buffer.
-    pub fn next_inst(&mut self,mut inst:EncInst) ->Result<(),&str> {
+    pub fn next_inst(&mut self,mut inst:WriteInst) ->Result<(),&str> {
         if self.cur_win.is_none() {
             return Err("No window started");
         }
@@ -66,7 +66,7 @@ impl<W: Write> VCDEncoder<W> {
     }
     ///This will fire off the unwritten buffered instruction encodings if the current slot has an instruction
     ///Otherwise it will just add the instruction to the empty slot in the buffer
-    fn add_inst(&mut self,inst:EncInst) {
+    fn add_inst(&mut self,inst:WriteInst) {
 
         //if cur pos is some, then we need to encode it and maybe it's successor
         if self.buffer[self.next_idx()].is_some() {
@@ -84,26 +84,44 @@ impl<W: Write> VCDEncoder<W> {
             //let cur_inst_len = inst.len_in_t(self.cur_u_pos());
             // 1. Mode Retrieval (For COPY)
             let (f_addr,f_mode) = match &inst {
-                EncInst::COPY(copy) => {
+                WriteInst::COPY(copy) => {
+                    debug_assert!({
+                        match copy.copy_type {
+                            CopyType::CopyQ { len_o } => {
+                                copy.len_in_u() + copy.u_pos - self.cur_u_pos() == len_o
+                            },
+                            CopyType::CopyS => true,
+                            CopyType::CopyT { inst_u_pos_start } => inst_u_pos_start == self.cur_u_pos(),
+                        }
+                    });
                     //we actually need to update the cache here or else a second copy would peek the wrong state
                     self.caches.addr_encode(copy.u_pos as usize, self.cur_u_pos() as usize)
                 },
-                EncInst::ADD(_) => (0,0), //ADD pass through
+                WriteInst::ADD(_) => (0,0), //ADD pass through
                 a => {//RUN short circuit
-                    let first = TableInst::from_enc_inst_first(a,0);
+                    let first = from_enc_inst_first(a,0);
                     self.encode_first_inst(offset, 0,first.size(),None);
                     return;
                 },
             };
             //first inst is not Run, so we need to try the second inst
-            let first = TableInst::from_enc_inst_first(&inst,f_mode);
+            let first = from_enc_inst_first(&inst,f_mode);
             if let Some(next) = self.buffer[(self.buffer_pos + offset + 1) % 3].as_ref() {
                 let sec_here = self.cur_u_pos()+inst.len_in_u();//+cur_inst_len;
                 let s_mode = match &next {
-                    EncInst::COPY(copy) => {
+                    WriteInst::COPY(copy) => {
+                        debug_assert!({
+                            match copy.copy_type {
+                                CopyType::CopyQ { len_o } => {
+                                    copy.len_in_u() + copy.u_pos - (self.cur_u_pos() + inst.len_in_o()) == len_o
+                                }CopyType::CopyS => true,
+                                CopyType::CopyT { inst_u_pos_start } => inst_u_pos_start == self.cur_u_pos() + inst.len_in_o(),
+                            }
+                        }, "Copy instruction does not match the expected length: {:?} cur_u_pos: {} inst_len: {}",copy,self.cur_u_pos() + inst.len_in_o(),next.len_in_o());
+
                         self.caches.peek_addr_encode(copy.u_pos as usize, sec_here as usize).1
                     },
-                    EncInst::RUN(_) => {//run cannot be the second inst, send the first inst through
+                    WriteInst::RUN(_) => {//run cannot be the second inst, send the first inst through
                         self.encode_first_inst(offset, get_single_inst_opcode(first),first.size(),Some(f_addr));
                         return;
                     },
@@ -111,7 +129,7 @@ impl<W: Write> VCDEncoder<W> {
                 };
 
                 // 2. TableInst Creation
-                let second = TableInst::from_enc_inst_sec(Some(next),s_mode);
+                let second = from_enc_inst_sec(Some(next),s_mode);
 
                 let table_entry = get_proper_table_entry(first,Some(second));
                 let start_offset = if table_entry.sec_is_noop() {0}else{163};
@@ -136,7 +154,7 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx this will panic
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        let inst_len = inst.len_in_o(self.cur_u_pos());
+        let inst_len = inst.len_in_o();
         self.cur_t_size += inst_len;
         self.inst_buffer.push(op_code);
         self.encode_inst_to_buffers(inst, size, addr);
@@ -150,8 +168,8 @@ impl<W: Write> VCDEncoder<W> {
         //if nothing exists at idx we do nothing
         let idx = (self.buffer_pos + offset) % 3;
         let inst = self.buffer[idx].take().unwrap();
-        let inst_len = inst.len_in_o(self.cur_u_pos());
-        let addr = if let EncInst::COPY(COPY { u_pos, .. }) = &inst {
+        let inst_len = inst.len_in_o();
+        let addr = if let WriteInst::COPY(COPY { u_pos, .. }) = &inst {
             Some(self.caches.addr_encode(*u_pos as usize, self.cur_u_pos() as usize).0)
         } else { None };
         //this must be after the addr calculation
@@ -160,23 +178,23 @@ impl<W: Write> VCDEncoder<W> {
     }
     ///This function takes an EncInst and splits it into the 3 buffers
     ///It DOES NOT increment the cur_t_size or change the unwritten buffer in any way.
-    fn encode_inst_to_buffers(&mut self, inst:EncInst, size:u8, addr:Option<u32>) {
+    fn encode_inst_to_buffers(&mut self, inst:WriteInst, size:u8, addr:Option<u32>) {
         if size == 0 {
             encode_integer(&mut self.inst_buffer, inst.len_in_u() as u64).unwrap();
         }
         match inst {
-            EncInst::ADD(data) => {
+            WriteInst::ADD(data) => {
                 self.data_buffer.extend(data);
             },
-            EncInst::COPY(_) => {
+            WriteInst::COPY(_) => {
                 encode_integer(&mut self.addr_buffer, addr.unwrap() as u64).unwrap();
             },
-            EncInst::RUN(run) => {
+            WriteInst::RUN(run) => {
                 self.data_buffer.push(run.byte);
             },
         }
     }
-    pub fn start_new_win(&mut self,win_hdr:WindowHeader)-> std::io::Result<()> {
+    pub fn start_new_win(&mut self,win_hdr:WriteWindowHeader)-> std::io::Result<()> {
         self.flush()?;
         self.cur_win = Some(win_hdr);
         self.caches = Cache::new();
@@ -191,7 +209,7 @@ impl<W: Write> VCDEncoder<W> {
             self.encode_insts(i);
         }
         debug_assert!(self.buffer[0].is_none() && self.buffer[1].is_none() && self.buffer[2].is_none());
-        if let Some(WindowHeader { win_indicator, source_segment_size, source_segment_position, size_of_the_target_window, delta_indicator }) = self.cur_win.take() {
+        if let Some(WriteWindowHeader { win_indicator, source_segment_size, source_segment_position, size_of_the_target_window, delta_indicator }) = self.cur_win.take() {
             //first clear our unwritten buffer and write the data to the 3 buffers
 
 
@@ -272,7 +290,7 @@ impl<W: Write> VCDEncoder<W> {
 }
 
 #[derive(Clone, Debug,PartialEq, Eq)]
-pub enum EncInst{
+pub enum WriteInst{
     ADD(Vec<u8>),
     RUN(RUN),
     //we take the COPY instruction verbatim
@@ -280,38 +298,14 @@ pub enum EncInst{
     //The address will only be right if they know what string U is already.
     COPY(COPY),
 }
-
-impl EncInst {
-    fn len_in_o(&self,cur_u_pos:u32) -> u32 {
-        match self {
-            EncInst::ADD(data) => data.len() as u32,
-            EncInst::RUN(run) => run.len,
-            EncInst::COPY(COPY { len, u_pos }) =>{
-                assert!(u_pos < &cur_u_pos, "COPY address must be less than the current U position");
-                let u_pos = *u_pos as u32;
-                let end = u_pos + *len;
-                if end > cur_u_pos {
-                    end - cur_u_pos
-                }else{
-                    *len
-                }
-            },
-        }
-    }
-    fn len_in_u(&self) -> u32 {
-        match self {
-            EncInst::ADD(data) => data.len() as u32,
-            EncInst::RUN(run) => run.len,
-            EncInst::COPY(copy) => copy.len,
-        }
-    }
-    fn try_merge(&mut self, other:&mut EncInst) -> bool {
+impl WriteInst{
+    fn try_merge(&mut self, other:&mut WriteInst) -> bool {
         match (self,other) {
-            (EncInst::ADD(data),EncInst::ADD(other_data)) => {
+            (WriteInst::ADD(data),WriteInst::ADD(other_data)) => {
                 data.append(other_data);
                 true
             },
-            (EncInst::RUN(run),EncInst::RUN(other_run)) if run.byte == other_run.byte => {
+            (WriteInst::RUN(run),WriteInst::RUN(other_run)) if run.byte == other_run.byte => {
                 run.len += other_run.len;
                 true
             },
@@ -319,89 +313,97 @@ impl EncInst {
         }
     }
 }
-impl CodeTableEntry{
-    fn sec_is_noop(&self) -> bool {
-        self.second == TableInst::NoOp
+
+impl Instruction for WriteInst {
+    fn len_in_u(&self) -> u32 {
+        match self {
+            WriteInst::ADD(data) => data.len() as u32,
+            WriteInst::RUN(run) => run.len,
+            WriteInst::COPY(copy) => copy.len,
+        }
+    }
+
+    fn inst_type(&self)->InstType {
+        match self {
+            WriteInst::ADD(_) => InstType::Add,
+            WriteInst::RUN(_) => InstType::Run,
+            WriteInst::COPY(c) => c.inst_type(),
+        }
+    }
+
+
+}
+
+
+fn from_enc_inst_first(inst:&WriteInst,mode:u8) -> TableInst {
+    let len = inst.len_in_u();
+    let mut size = if len > u8::MAX as u32{
+        0
+    } else {
+        len as u8
+    };
+    match inst {
+        WriteInst::ADD(_) => {
+            if !(1..=17).contains(&size) {
+                size = 0;
+            }
+            TableInst::Add { size }
+        },
+        WriteInst::RUN(_) => TableInst::Run,
+        WriteInst::COPY(_) => {
+            if !(4..=18).contains(&size) {
+                size = 0;
+            }
+            TableInst::Copy { size, mode }
+        },
+    }
+}
+fn from_enc_inst_sec(inst:Option<&WriteInst>,mode:u8) -> TableInst {
+    if inst.is_none() {
+        return TableInst::NoOp;
+    }
+    let inst = inst.unwrap();
+    let len = inst.len_in_u();
+    let size = if len > u8::MAX as u32{
+        0
+    } else {
+        len as u8
+    };
+    match inst {
+        WriteInst::COPY(_) => {
+            match mode {
+                0..=5 => {
+                    if (4..=6).contains(&size) {
+                        TableInst::Copy { size, mode }
+                    }else{
+                        TableInst::NoOp
+                    }
+                },
+                6..=8 => {
+                    if size == 4{
+                        TableInst::Copy { size, mode }
+                    }else{
+                        TableInst::NoOp
+                    }
+                },
+                _ => TableInst::NoOp,
+            }
+        },
+        WriteInst::ADD(_) => {
+            if size == 1 {
+                TableInst::Add { size }
+            }else{
+                TableInst::NoOp
+            }
+        },
+        WriteInst::RUN(_) => TableInst::NoOp,
     }
 }
 
-impl TableInst{
-    fn from_enc_inst_first(inst:&EncInst,mode:u8) -> Self {
-        let len = inst.len_in_u();
-        let mut size = if len > u8::MAX as u32{
-            0
-        } else {
-            len as u8
-        };
-        match inst {
-            EncInst::ADD(_) => {
-                if !(1..=17).contains(&size) {
-                    size = 0;
-                }
-                TableInst::Add { size }
-            },
-            EncInst::RUN(_) => TableInst::Run,
-            EncInst::COPY(_) => {
-                if !(4..=18).contains(&size) {
-                    size = 0;
-                }
-                TableInst::Copy { size, mode }
-            },
-        }
-    }
-    fn from_enc_inst_sec(inst:Option<&EncInst>,mode:u8) -> Self {
-        if inst.is_none() {
-            return TableInst::NoOp;
-        }
-        let inst = inst.unwrap();
-        let len = inst.len_in_u();
-        let size = if len > u8::MAX as u32{
-            0
-        } else {
-            len as u8
-        };
-        match inst {
-            EncInst::COPY(_) => {
-                match mode {
-                    0..=5 => {
-                        if (4..=6).contains(&size) {
-                            TableInst::Copy { size, mode }
-                        }else{
-                            TableInst::NoOp
-                        }
-                    },
-                    6..=8 => {
-                        if size == 4{
-                            TableInst::Copy { size, mode }
-                        }else{
-                            TableInst::NoOp
-                        }
-                    },
-                    _ => TableInst::NoOp,
-                }
-            },
-            EncInst::ADD(_) => {
-                if size == 1 {
-                    TableInst::Add { size }
-                }else{
-                    TableInst::NoOp
-                }
-            },
-            EncInst::RUN(_) => TableInst::NoOp,
-        }
-    }
-    fn size(&self) -> u8 {
-        match self {
-            TableInst::Add { size } => *size,
-            TableInst::Run => 0,
-            TableInst::Copy { size, .. } => *size,
-            TableInst::NoOp => 0,
-        }
-    }
-}
+
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WindowHeader {
+pub struct WriteWindowHeader {
     pub win_indicator: WinIndicator,
     pub source_segment_size: Option<u64>,
     pub source_segment_position: Option<u64>,
@@ -425,6 +427,8 @@ fn get_single_inst_opcode(first:TableInst) -> u8 {
 #[cfg(test)]
 mod test_super {
 
+    use vcdiff_common::CopyType;
+
     use super::*;
     use std::io::Cursor;
     #[test]
@@ -447,25 +451,25 @@ mod test_super {
         // Setup
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let mut writer = VCDWriter::new(mock_sink, header).unwrap();
 
         // Create a new window
-        let win_hdr = WindowHeader {
+        let win_hdr = WriteWindowHeader {
             win_indicator: WinIndicator::Neither,
             source_segment_size: None,
             source_segment_position: None,
             size_of_the_target_window: 5,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(win_hdr).unwrap();
+        writer.start_new_win(win_hdr).unwrap();
 
         // Instructions
-        encoder.next_inst(EncInst::ADD(vec![b'h',b'e'])).unwrap();
-        encoder.next_inst(EncInst::RUN(RUN { len: 2, byte: b'l' })).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'o'])).unwrap();
+        writer.next_inst(WriteInst::ADD(vec![b'h',b'e'])).unwrap();
+        writer.next_inst(WriteInst::RUN(RUN { len: 2, byte: b'l' })).unwrap();
+        writer.next_inst(WriteInst::ADD(vec![b'o'])).unwrap();
 
         // Force encoding
-        let w = encoder.finish().unwrap().into_inner();
+        let w = writer.finish().unwrap().into_inner();
         let answer = vec![
             214, 195, 196, 0,  //magic
             0,  //hdr_indicator
@@ -490,25 +494,25 @@ mod test_super {
         // Setup
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let mut writer = VCDWriter::new(mock_sink, header).unwrap();
 
         // Create a new window
-        let win_hdr = WindowHeader {
+        let win_hdr = WriteWindowHeader {
             win_indicator: WinIndicator::Neither,
             source_segment_size: None,
             source_segment_position: None,
             size_of_the_target_window: 8,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(win_hdr).unwrap();
+        writer.start_new_win(win_hdr).unwrap();
 
         // Instructions -> "" -> "tererest'
-        encoder.next_inst(EncInst::ADD(vec![b't',b'e',b'r'])).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 1 })).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b's',b't'])).unwrap();
+        writer.next_inst(WriteInst::ADD(vec![b't',b'e',b'r'])).unwrap();
+        writer.next_inst(WriteInst::COPY(COPY { len: 5, u_pos: 1,copy_type:CopyType::CopyQ { len_o:3 } })).unwrap();
+        writer.next_inst(WriteInst::ADD(vec![b's',b't'])).unwrap();
 
         // Force encoding
-        let w = encoder.finish().unwrap().into_inner();
+        let w = writer.finish().unwrap().into_inner();
         let answer = vec![
             214, 195, 196, 0,  //magic
             0,  //hdr_indicator
@@ -532,27 +536,27 @@ mod test_super {
         // Setup
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
+        let mut writer = VCDWriter::new(mock_sink, header).unwrap();
 
         // New window
-        let win_hdr = WindowHeader {
+        let win_hdr = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_SOURCE,
             source_segment_size: Some(4),
             source_segment_position: Some(1),
             size_of_the_target_window: 13,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(win_hdr).unwrap();
+        writer.start_new_win(win_hdr).unwrap();
 
         // Instructions
         // "hello" -> "Hello! Hello!"
-        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap(); // Add 'H'
-        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap(); // Copy 'ello'
-        encoder.next_inst(EncInst::ADD(vec![b'!', b' '])).unwrap(); // Add '! '
-        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 4  })).unwrap(); // Copy "Hello!"
+        writer.next_inst(WriteInst::ADD(vec![b'H'])).unwrap(); // Add 'H'
+        writer.next_inst(WriteInst::COPY(COPY{ len: 4, u_pos: 0,copy_type:CopyType::CopyS })).unwrap(); // Copy 'ello'
+        writer.next_inst(WriteInst::ADD(vec![b'!', b' '])).unwrap(); // Add '! '
+        writer.next_inst(WriteInst::COPY(COPY{ len: 6, u_pos: 4,copy_type:CopyType::CopyT { inst_u_pos_start: 11 }  })).unwrap(); // Copy "Hello!"
 
         // Force encoding (remains the same)
-        let w = encoder.finish().unwrap().into_inner();
+        let w = writer.finish().unwrap().into_inner();
         //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
@@ -567,7 +571,7 @@ mod test_super {
             2, //length of instructions and sizes
             2, //length of addresses for COPYs
             72,33,32, //'H! ' data section
-            235, //ADD1 COPY4_mode6
+            163, //ADD1 COPY4_mode6
             183, //ADD2 COPY6_mode0
             0,
             4,
@@ -579,17 +583,17 @@ mod test_super {
     pub fn neither_win(){
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
-        let n_window = WindowHeader {
+        let mut writer = VCDWriter::new(mock_sink, header).unwrap();
+        let n_window = WriteWindowHeader {
             win_indicator: WinIndicator::Neither,
             source_segment_size: None,
             source_segment_position: None,
             size_of_the_target_window: 1,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(n_window).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
-        let w = encoder.finish().unwrap().into_inner();
+        writer.start_new_win(n_window).unwrap();
+        writer.next_inst(WriteInst::ADD(vec![b'H'])).unwrap();
+        let w = writer.finish().unwrap().into_inner();
         //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
@@ -615,38 +619,38 @@ mod test_super {
         //then we encode the Copy(Hello!) in the Target window
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
-        let n_window = WindowHeader {
+        let mut wrtier = VCDWriter::new(mock_sink, header).unwrap();
+        let n_window = WriteWindowHeader {
             win_indicator: WinIndicator::Neither,
             source_segment_size: None,
             source_segment_position: None,
             size_of_the_target_window: 1,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(n_window).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
-        let s_window = WindowHeader {
+        wrtier.start_new_win(n_window).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b'H'])).unwrap();
+        let s_window = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_SOURCE,
             source_segment_size: Some(4),
             source_segment_position: Some(1),
             size_of_the_target_window: 5,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(s_window).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'!'])).unwrap();
-        let t_window = WindowHeader {
+        wrtier.start_new_win(s_window).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 4, u_pos: 0,copy_type:CopyType::CopyS })).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b'!'])).unwrap();
+        let t_window = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_TARGET,
             source_segment_size: Some(6),
             source_segment_position: Some(0),
             size_of_the_target_window: 7,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(t_window).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b' '])).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 0 })).unwrap();
+        wrtier.start_new_win(t_window).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b' '])).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 6, u_pos: 0 ,copy_type:CopyType::CopyS})).unwrap();
 
-        let w = encoder.finish().unwrap().into_inner();
+        let w = wrtier.finish().unwrap().into_inner();
         //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
@@ -670,20 +674,19 @@ mod test_super {
             1, //length of instructions and size
             1, //length of addr
             33, //data section '!'
-            253, //COPY4_mode5 ADD1
+            247, //COPY4_mode0 ADD1
             0, //addr 0
             2, //win_indicator VCD_TARGET
             6, //SSS
             0, //SSP
-            9, //delta window size
+            8, //delta window size
             7, //target window size
             0, //delta indicator
             1, //length of data for ADDs and RUN/
-            2, //length of instructions and size
+            1, //length of instructions and size
             1, //length of addr
             32, //data section ' '
-            2, //ADD1 NOOP
-            118, //COPY6_mode6 NOOP
+            165, //ADD1 COPY6_mode0
             0, //addr 0
         ];
 
@@ -705,50 +708,50 @@ mod test_super {
         //then we encode an implicit Copy For the last '..' chars.
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
-        let n_window = WindowHeader {
+        let mut wrtier = VCDWriter::new(mock_sink, header).unwrap();
+        let n_window = WriteWindowHeader {
             win_indicator: WinIndicator::Neither,
             source_segment_size: None,
             source_segment_position: None,
             size_of_the_target_window: 1,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(n_window).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'H'])).unwrap();
-        let s_window = WindowHeader {
+        wrtier.start_new_win(n_window).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b'H'])).unwrap();
+        let s_window = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_SOURCE,
             source_segment_size: Some(4),
             source_segment_position: Some(1),
             size_of_the_target_window: 5,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(s_window).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 4, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'!'])).unwrap();
-        let t_window = WindowHeader {
+        wrtier.start_new_win(s_window).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 4, u_pos: 0, copy_type:CopyType::CopyS })).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b'!'])).unwrap();
+        let t_window = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_TARGET,
             source_segment_size: Some(6),
             source_segment_position: Some(0),
             size_of_the_target_window: 7,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(t_window).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b' '])).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 6, u_pos: 0 })).unwrap();
-        let t_window = WindowHeader {
+        wrtier.start_new_win(t_window).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b' '])).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 6, u_pos: 0,copy_type:CopyType::CopyS })).unwrap();
+        let t_window = WriteWindowHeader {
             win_indicator: WinIndicator::VCD_TARGET,
             source_segment_size: Some(5),
             source_segment_position: Some(6),
             size_of_the_target_window: 8,
             delta_indicator: DeltaIndicator::default(),
         };
-        encoder.start_new_win(t_window).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 5, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::ADD(vec![b'.'])).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY{ len: 3, u_pos: 10 })).unwrap();
+        wrtier.start_new_win(t_window).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 5, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
+        wrtier.next_inst(WriteInst::ADD(vec![b'.'])).unwrap();
+        wrtier.next_inst(WriteInst::COPY(COPY{ len: 3, u_pos: 10,copy_type:CopyType::CopyQ { len_o: 2 }  })).unwrap();
 
 
-        let w = encoder.finish().unwrap().into_inner();
+        let w = wrtier.finish().unwrap().into_inner();
         //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
@@ -772,20 +775,19 @@ mod test_super {
             1, //length of instructions and size
             1, //length of addr
             33, //data section '!'
-            253, //COPY4_mode5 ADD1
+            247, //COPY4_mode0 ADD1
             0, //addr 0
             2, //win_indicator VCD_TARGET
             6, //SSS
             0, //SSP
-            9, //delta window size
+            8, //delta window size
             7, //target window size
             0, //delta indicator
             1, //length of data for ADDs and RUN/
-            2, //length of instructions and size
+            1, //length of instructions and size
             1, //length of addr
             32, //data section ' '
-            2, //ADD1 NOOP
-            118, //COPY6_mode6 NOOP
+            165, //ADD1 COPY6_mode0
             0, //addr 0
             2, //win_indicator VCD_TARGET
             5, //SSS
@@ -797,12 +799,12 @@ mod test_super {
             4, //length of instructions and size
             2, //length of addr
             46, //data section '.'
-            117, //ADD1 COPY5_mode6
+            21, //ADD1 COPY5_mode0
             2, //Add1 NOOP
-            35, //COPY0_mode1
+            19, //COPY0_mode0
             3, //...size
             0, //addr 0
-            1, //addr 1
+            10, //addr 1
         ];
 
         assert_eq!(w, answer);
@@ -815,18 +817,19 @@ mod test_super {
 
         let mock_sink = Cursor::new(Vec::new());
         let header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-        let mut encoder = VCDEncoder::new(mock_sink, header).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(11), source_segment_position: Some(1), size_of_the_target_window:7 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::ADD("H".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 0 })).unwrap(); //ello
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 10 })).unwrap(); //'!'
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 4 })).unwrap(); //' '
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(7), source_segment_position: Some(0), size_of_the_target_window:14 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 19, u_pos: 0 })).unwrap(); //Hello! Hello! Hello
-        encoder.next_inst(EncInst::ADD(".".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 13 })).unwrap(); // ' '
+        let mut writer = VCDWriter::new(mock_sink, header).unwrap();
+        writer.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(11), source_segment_position: Some(1), size_of_the_target_window:7 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        writer.next_inst(WriteInst::ADD("H".as_bytes().to_vec())).unwrap();
+        writer.next_inst(WriteInst::COPY(COPY { len: 4, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //ello
+        writer.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 10,copy_type:CopyType::CopyS  })).unwrap(); //'!'
+        writer.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 4,copy_type:CopyType::CopyS  })).unwrap(); //' '
+        writer.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(7), source_segment_position: Some(0), size_of_the_target_window:14 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        writer.next_inst(WriteInst::COPY(COPY { len: 7, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //'Hello! '
+        writer.next_inst(WriteInst::COPY(COPY { len: 12, u_pos: 7,copy_type:CopyType::CopyQ { len_o:5 }  })).unwrap(); //'Hello! Hello'
+        writer.next_inst(WriteInst::ADD(".".as_bytes().to_vec())).unwrap();
+        writer.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 13,copy_type:CopyType::CopyT { inst_u_pos_start: 20 }})).unwrap(); // ' '
 
-        let w = encoder.finish().unwrap().into_inner();
+        let w = writer.finish().unwrap().into_inner();
         //dbg!(&w);
         let answer = vec![
             214,195,196,0, //magic
@@ -841,31 +844,32 @@ mod test_super {
             5, //length of instructions and size
             3, //length of addr
             72, //data section 'H'
-            235, //ADD1 COPY4_mode6
-            35, //COPY0_mode1
+            163, //ADD1 COPY4_mode0
+            19, //COPY0_mode0
             1, //..size
             19, //COPY0_mode0
             1, //..size
             0, //addr 0
-            6, //addr 1
+            10, //addr 1
             4, //addr 2
             2, //win_indicator VCD_TARGET
             7, //SSS
             0, //SSP
-            13, //delta window size
+            14, //delta window size
             14, //target window size
             0, //delta indicator
             1, //length of data for ADDs and RUN/
             5, //length of instructions and size
-            2, //length of addr
+            3, //length of addr
             46, //data section '.'
-            115, //COPY0_mode6 noop
-            19, //..size
+            23, //COPY0_mode0 noop
+            28, //..size
             2, //Add1 NOOP
-            35, //COPY0_mode1
+            19, //COPY0_mode0
             1, //..size
             0, //addr 0
             7, //addr 1
+            13, //addr 2
         ];
 
         assert_eq!(w, answer);

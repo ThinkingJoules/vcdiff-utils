@@ -1,4 +1,33 @@
-TODO:
-- Re-write encoder. There is an error in the encoding of some copy address. For now, am just encoding everything as mode 0 in the merged patch file. The error could be in the cache, but it looks correct. The assertion never triggers but I get decode errors, which mean we are feeding it incorrect data that makes it out of sync with the decode cache.
-- Re-write Merger. Get rid of translator entirely? We need to work two patches at a time. I think we need to just load all instructions in to memory from earlier patch
-- Early return Merger. If we are given the terminal patch and it doesn't contain any copy instructions, then merging an earlier patch would have no effect. In theory if we only merge two patches at once, then after each merge occurs, we should have an early return branch as well.
+# vcdiff-utils: A comprehensive set of Rust libraries for working with the VCDIFF format
+
+# About
+The VCDIFF format (RFC 3284) is a versatile and efficient way to represent differences between files. This workspace provides a suite of Rust libraries for creating, reading, manipulating, and applying VCDIFF files.
+
+There are no dependencies as this was implemented from scratch.
+
+# Crates
+The vcdiff-utils workspace includes the following crates:
+
+- vcdiff-common
+    - Defines core VCDIFF data structures (header, instructions, windows, etc.)
+    - Provides traits for interacting with VCDIFF components abstractly, enabling flexibility.
+- vcdiff-reader
+    - Parses VCDIFF-formatted files into usable Rust data structures.
+    - Performs robust validation to ensure correct VCDIFF format adherence.
+    - Detects implicit sequences and makes them explicit
+- vcdiff-decoder
+    - Applies VCDIFF patches to source files for target file reconstruction.
+- vcdiff-writer
+    - Helps generate valid VCDIFF format files.
+    - This is not an encoder. This is the opposite of the vcdiff-reader.
+- vcdiff-merger
+    - Combines multiple intermediate VCDIFF patches into a single summary patch.
+    - Detects and handles potential merge conflicts intelligently.
+
+- vcdiff-testing
+    - Only used for testing.
+    - Tests against xdelta3 and Google's open-vcdiff lib.
+
+# Assumptions
+- Maximum single instruction length is a u32::MAX
+- Maximum super string 'U' length is u32::MAX.

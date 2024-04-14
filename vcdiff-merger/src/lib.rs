@@ -1,6 +1,447 @@
-use std::{fmt::Debug, io::{Read, Seek,Write}, num::NonZeroU32, ops::Range};
 
-use crate::{encoder::{EncInst, VCDEncoder, WindowHeader}, extractor::{extract_patch_instructions, get_exact_slice, sum_len, CopyInst, CopyType, DisCopy, DisInst, ExAdd, ExInstType, InstType, Instruction, VcdExtract}, reader::{Header, WinIndicator}, COPY};
+
+use std::{fmt::Debug, io::{Read, Seek, Write}, num::NonZeroU32, ops::Range};
+
+use vcdiff_common::{CopyType, Header, Inst, InstType, Instruction, WinIndicator, ADD, COPY, RUN};
+use vcdiff_reader::{VCDReader, VCDiffReadMsg};
+use vcdiff_writer::{VCDWriter, WriteInst, WriteWindowHeader};
+
+
+///Disassociated Copy (from the window it was found in).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DCopy{
+    pub u_pos:u32,
+    pub len_u:u32,
+    pub sss:u32,
+    pub ssp:u64,
+    pub vcd_trgt:bool,
+    pub copy_type:CopyType,
+}
+impl MergeInst for DCopy{
+    fn skip(&mut self,amt:u32){
+        self.u_pos += amt;
+        self.len_u -= amt;
+        match self.copy_type{
+            CopyType::CopyQ{..} => {
+                panic!("CopyQ should not be skipped!");
+            },
+            _ => {}
+        }
+    }
+    fn trunc(&mut self,amt:u32){
+        self.len_u = self.len_u - amt;
+        match self.copy_type{
+            CopyType::CopyQ{..} => {
+                panic!("CopyQ should not be truncated!");
+            },
+            _ => {}
+        }
+    }
+    fn src_range(&self)->Option<Range<u64>>{
+        let new_ssp = self.ssp() + self.u_start_pos() as u64;
+        let new_end = new_ssp + self.len_in_u() as u64;
+        debug_assert!(new_end <= self.ssp() + self.sss() as u64,
+            "new_end:{} ssp:{} sss:{}",new_end,self.ssp(),self.sss() as u64
+        );
+        Some(new_ssp..new_end)
+    }
+
+}
+impl Instruction for DCopy{
+    fn len_in_u(&self)->u32{
+        self.len_u
+    }
+
+    fn inst_type(&self)->InstType {
+        InstType::Copy(self.copy_type)
+    }
+
+}
+impl DCopy{
+    fn from_copy(copy:COPY,ssp:u64,sss:u32,vcd_trgt:bool)->Self{
+        let COPY { len, u_pos, copy_type } = copy;
+        DCopy{
+            u_pos,
+            len_u:len,
+            sss,
+            ssp,
+            vcd_trgt,
+            copy_type,
+        }
+    }
+    fn u_start_pos(&self)->u32{
+        self.u_pos
+    }
+    fn ssp(&self)->u64{
+        self.ssp
+    }
+    fn sss(&self)->u32{
+        self.sss
+    }
+    fn vcd_trgt(&self)->bool{
+        self.vcd_trgt
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExAdd{
+    pub bytes:Vec<u8>,
+}
+impl Instruction for ExAdd{
+    fn len_in_u(&self)->u32{
+        self.bytes.len() as u32
+    }
+    fn inst_type(&self)->InstType {
+        InstType::Add
+    }
+}
+impl MergeInst for ExAdd{
+    fn skip(&mut self,amt:u32){
+        self.bytes = self.bytes.split_off(amt as usize);
+    }
+    fn trunc(&mut self,amt:u32){
+        self.bytes.truncate(self.bytes.len() - amt as usize);
+    }
+    fn src_range(&self)->Option<Range<u64>> {
+        None
+    }
+}
+impl MergeInst for RUN{
+    fn skip(&mut self,amt:u32){
+        self.len -= amt;
+    }
+    fn trunc(&mut self,amt:u32){
+        self.len = self.len - amt;
+    }
+    fn src_range(&self)->Option<Range<u64>> {
+        None
+    }
+}
+
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DInst{
+    Add(ExAdd),
+    Run(RUN),
+    Copy(DCopy),
+}
+impl Instruction for DInst{
+    fn len_in_u(&self)->u32{
+        match self{
+            DInst::Add(bytes) => bytes.len_in_u(),
+            DInst::Run(run) => run.len,
+            DInst::Copy(copy) => copy.len_in_u(),
+        }
+    }
+    fn inst_type(&self)->InstType{
+        match self{
+            DInst::Add(_) => InstType::Add,
+            DInst::Run(_) => InstType::Run,
+            DInst::Copy(copy) => copy.inst_type(),
+        }
+    }
+}
+impl MergeInst for DInst{
+    fn skip(&mut self,amt:u32){
+        match self{
+            DInst::Add(bytes) => bytes.skip(amt),
+            DInst::Run(run) => run.skip(amt),
+            DInst::Copy(copy) => copy.skip(amt),
+        }
+    }
+    fn trunc(&mut self,amt:u32){
+        match self{
+            DInst::Add(bytes) => bytes.trunc(amt),
+            DInst::Run(run) => run.trunc(amt),
+            DInst::Copy(copy) => copy.trunc(amt),
+        }
+    }
+    fn src_range(&self)->Option<Range<u64>>{
+        match self{
+            DInst::Add(_) => None,
+            DInst::Run(_) => None,
+            DInst::Copy(copy) => copy.src_range(),
+        }
+    }
+}
+impl DInst {
+    pub fn take_copy(self)->Option<DCopy>{
+        match self{
+            DInst::Copy(copy) => Some(copy),
+            _ => None,
+        }
+    }
+    pub fn vcd_trgt(&self)->bool{
+        match self{
+            DInst::Add(_) => false,
+            DInst::Run(_) => false,
+            DInst::Copy(copy) => copy.vcd_trgt(),
+        }
+    }
+}
+
+
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SparseInst{
+    pub o_pos_start:u64,
+    pub inst:DInst,
+}
+impl Instruction for SparseInst{
+    fn len_in_u(&self)->u32{
+        self.inst.len_in_u()
+    }
+    fn inst_type(&self)->InstType{
+        self.inst.inst_type()
+    }
+}
+impl MergeInst for SparseInst{
+    fn skip(&mut self,amt:u32){
+        self.o_pos_start += amt as u64;
+        self.inst.skip(amt);
+    }
+    fn trunc(&mut self,amt:u32){
+        self.inst.trunc(amt);
+    }
+
+    fn src_range(&self)->Option<Range<u64>>{
+        self.inst.src_range()
+    }
+}
+impl PosInst for SparseInst{
+    fn o_start(&self)->u64{
+        self.o_pos_start
+    }
+}
+
+pub trait PosInst:MergeInst{
+    fn o_start(&self)->u64;
+}
+pub trait MergeInst:Instruction{
+    fn skip(&mut self,amt:u32);
+    fn trunc(&mut self,amt:u32);
+    fn src_range(&self)->Option<Range<u64>>;
+    fn will_fit_window(&self,max_space_avail:NonZeroU32)->Option<NonZeroU32>{
+        //can we figure out how much to truncate to fit in the space?
+        match self.src_range(){
+            None => {
+                //Add or Run
+                let cur_u_len = self.len_in_u();
+                if cur_u_len <= max_space_avail.into(){
+                    return None;
+                }else{
+                    Some(max_space_avail)
+                }
+            },
+            Some(min) => {//Copy Math
+                //every change in len, also shrinks the sss
+                let cur_s_len = min.end - min.start;
+                let cur_u_len = self.len_in_u() + cur_s_len as u32;
+                if cur_u_len <= max_space_avail.into() {
+                    return None;
+                }else{
+                    let new_len = max_space_avail.get() as u64 - cur_s_len;
+                    if new_len == 0{
+                        None
+                    }else{
+                        Some(NonZeroU32::new(new_len as u32).unwrap())
+                    }
+                }
+            }
+        }
+    }
+    fn split_at(mut self,first_inst_len:u32)->(Self,Self){
+        assert!(!self.is_implicit_seq());
+        let mut second = self.clone();
+        self.trunc(self.len_in_u() - first_inst_len);
+        second.skip(first_inst_len);
+        (self,second)
+    }
+}
+
+
+
+pub fn comp_indicator(inst_type: &InstType, cur_ind: &WinIndicator, vcd_trgt: bool) -> Option<WinIndicator> {
+    match (inst_type, cur_ind, vcd_trgt) {
+        (InstType::Copy { .. }, WinIndicator::VCD_SOURCE, true)
+        | (InstType::Copy { .. }, WinIndicator::Neither, true) => Some(WinIndicator::VCD_TARGET),
+        (InstType::Copy { .. }, WinIndicator::VCD_TARGET, false)
+        | (InstType::Copy { .. }, WinIndicator::Neither, false) => Some(WinIndicator::VCD_SOURCE),
+        _ => None,
+    }
+}
+
+pub fn find_controlling_inst<I:PosInst>(insts:&[I],o_pos:u64)->Option<usize>{
+    let inst = insts.binary_search_by(|probe|{
+        let end = probe.o_start() + probe.len_in_o() as u64;
+        if (probe.o_start()..end).contains(&o_pos){
+            return std::cmp::Ordering::Equal
+        }else if probe.o_start() > o_pos {
+            return std::cmp::Ordering::Greater
+        }else{
+            return std::cmp::Ordering::Less
+        }
+    });
+    if let Ok(idx) = inst {
+        Some(idx)
+    }else {
+        None
+    }
+}
+pub fn sum_len<I:Instruction>(insts:&[I])->u64{
+    insts.iter().map(|i| i.len_in_o() as u64).sum()
+}
+pub fn get_exact_slice<I:PosInst+Debug>(instructions:&[I],start:u64,len:u32)->Option<Vec<I>>{
+    let start_idx = find_controlling_inst(instructions,start)?;
+    let end_pos = start + len as u64;
+    let mut slice = Vec::new();
+
+    for inst in instructions[start_idx..].iter() {
+        let inst_len = inst.len_in_o();
+        let o_start = inst.o_start();
+        let cur_inst_end = o_start + inst_len as u64;
+        let mut cur_inst = inst.clone();
+        if start > o_start {
+            let skip = start - o_start;
+            cur_inst.skip(skip as u32);
+        }
+        if end_pos < cur_inst_end {
+            let trunc = cur_inst_end - end_pos;
+            cur_inst.trunc(trunc as u32);
+        }
+        debug_assert!(cur_inst.len_in_o() > 0, "The instruction length is zero");
+        slice.push(cur_inst);
+
+        if cur_inst_end >= end_pos {
+
+            break;
+        }
+    }
+    debug_assert!(sum_len(&slice)==len as u64,"{} != {} start:{} end_pos:{} ... {:?} from {:?}",sum_len(&slice),len,start,end_pos,&slice,instructions);
+    Some(slice)
+}
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stats{
+    pub add_bytes:usize,
+    pub run_bytes:usize,
+    pub copy_bytes:usize,
+    pub add_cnt:usize,
+    pub run_cnt:usize,
+    pub copy_s_cnt:usize,
+    pub copy_t_cnt:usize,
+    pub copy_q_cnt:usize,
+    pub output_size:usize,
+    pub contains_vcd_target:bool,
+}
+
+impl Stats {
+    pub fn new() -> Self {
+        Default::default()
+    }
+    pub fn add(&mut self, len:usize){
+        self.add_bytes += len;
+        self.add_cnt += 1;
+        self.output_size += len;
+    }
+    pub fn run(&mut self, len:usize){
+        self.run_bytes += len;
+        self.run_cnt += 1;
+        self.output_size += len;
+    }
+    pub fn copy_s(&mut self, len:usize){
+        self.copy_bytes += len;
+        self.copy_s_cnt += 1;
+        self.output_size += len;
+    }
+    pub fn copy_t(&mut self, len:usize){
+        self.copy_bytes += len;
+        self.copy_t_cnt += 1;
+        self.output_size += len;
+    }
+    pub fn copy_q(&mut self, len_in_o:usize){
+        self.copy_bytes += len_in_o;
+        self.copy_q_cnt += 1;
+        self.output_size += len_in_o;
+    }
+    pub fn vcd_trgt(&mut self){
+        self.contains_vcd_target = true;
+    }
+    pub fn has_copy(&self)->bool{
+        self.copy_bytes > 0
+    }
+}
+
+///Extracts all instructions from all windows.
+///Memory consumption may be 2-4x the size of the encoded (uncompressed) patch.
+pub fn extract_patch_instructions<R:Read + Seek>(patch:R)->std::io::Result<(Vec<SparseInst>, Stats)>{
+    let mut insts = Vec::new();
+    let mut reader = VCDReader::new(patch)?;
+    let mut ssp = None;
+    let mut sss = None;
+    let mut vcd_trgt = false;
+    let mut o_pos_start = 0;
+    let mut stats = Stats::new();
+    loop{
+        match reader.next()?{
+            VCDiffReadMsg::WindowSummary(ws) => {
+                ssp = ws.source_segment_position;
+                sss = ws.source_segment_size;
+                if ws.win_indicator == WinIndicator::VCD_TARGET{
+                    vcd_trgt = true;
+                    stats.vcd_trgt();
+                }
+            },
+            VCDiffReadMsg::Inst { first, second } => {
+                for inst in [Some(first), second]{
+                    if inst.is_none(){
+                        continue;
+                    }
+                    let inst = inst.unwrap();
+                    let len_o = inst.len_in_o() as usize;
+                    match inst{
+                        Inst::Add(ADD{ len, p_pos }) => {
+                            let mut bytes = vec![0; len as usize];
+                            reader.read_from_src(p_pos, &mut bytes)?;
+                            insts.push(SparseInst{o_pos_start,inst:DInst::Add(ExAdd { bytes })});
+                            stats.add(len_o);
+                        },
+                        Inst::Run(run) => {
+                            stats.run(len_o);
+                            insts.push(SparseInst{o_pos_start,inst:DInst::Run(run)})
+                        },
+                        Inst::Copy(copy) =>{
+                            let ssp = ssp.expect("SSP not set");
+                            let sss = sss.expect("SSS not set");
+                            match copy.copy_type{
+                                CopyType::CopyQ{..} => {
+                                    stats.copy_q(len_o);
+                                },
+                                CopyType::CopyS => {
+                                    stats.copy_s(len_o);
+                                },
+                                CopyType::CopyT{..} => {
+                                    stats.copy_t(len_o);
+                                },
+                            }
+                            insts.push(SparseInst{
+                                o_pos_start,
+                                inst:DInst::Copy(DCopy::from_copy(copy, ssp, sss as u32, vcd_trgt))
+                            });
+                        }
+                    }
+                    o_pos_start += len_o as u64;
+                }
+            },
+            VCDiffReadMsg::EndOfWindow => {
+                ssp = None;
+                sss = None;
+                vcd_trgt = false;
+            },
+            VCDiffReadMsg::EndOfFile => break,
+        }
+    }
+    Ok((insts,stats))
+}
 
 /*
 In theory we only ever need to compare two patch files at once.
@@ -26,39 +467,37 @@ Since we don't have the actual data, we can't encode anything other than CopySS.
 This means the merge patch will only ever have win_indicators of VCD_SOURCE (or NEITHER).
 */
 
-pub fn deref_non_copy_ss(extracted:Vec<VcdExtract>)->Vec<VcdExtract>{
-    let mut output:Vec<VcdExtract> = Vec::with_capacity(extracted.len());
+pub fn deref_non_copy_ss(extracted:Vec<SparseInst>)->Vec<SparseInst>{
+    let mut output:Vec<SparseInst> = Vec::with_capacity(extracted.len());
     let mut cur_o_pos = 0;
-    for DisInst { inst, .. } in extracted {
-        let (o_start,slice_len,seq_len) = match inst.inst_type(){
-            InstType::Copy { copy_type:CopyType::CopyS, vcd_trgt:false } |
-            InstType::Run |
-            InstType::Add => {
+    for SparseInst { inst, .. } in extracted {
+        let (o_start,slice_len,seq_len) = match (inst.inst_type(),inst.vcd_trgt()){
+            (InstType::Copy (CopyType::CopyS),false) |
+            (InstType::Run, _) |
+            (InstType::Add, _) => {
                 let o_pos_start = cur_o_pos;
                 cur_o_pos += inst.len_in_o() as u64;
-                output.push(DisInst { o_pos_start, inst });
+                output.push(SparseInst { o_pos_start, inst });
                 continue;
             },
-            InstType::Copy { copy_type:CopyType::CopyQ { len_o }, .. } => {
+            (InstType::Copy (CopyType::CopyQ { len_o }),_) => {
                 let slice_len = inst.len_in_u() - len_o;
                 let o_start = cur_o_pos - slice_len as u64;
                 (o_start,slice_len,len_o)
             },
-            InstType::Copy { copy_type:CopyType::CopyT { inst_u_pos_start }, .. } => {
+            (InstType::Copy (CopyType::CopyT { inst_u_pos_start }),_) => {
                 let copy = inst.clone().take_copy().unwrap();
                 let offset = inst_u_pos_start - copy.u_pos;
                 let o_start = cur_o_pos - offset as u64;
                 (o_start,copy.len_in_u(),0)
             },
-            InstType::Copy { copy_type:CopyType::CopyS, vcd_trgt } => {
-                debug_assert!(vcd_trgt, "We should only be resolving Trgt sourced Copys here");
+            (InstType::Copy (CopyType::CopyS),true) => {
                 let copy = inst.clone().take_copy().unwrap();
                 let o_start = copy.ssp + copy.u_pos as u64;
                 (o_start,copy.len_in_u(),0)
             },
 
         };
-
         let resolved = get_exact_slice(output.as_slice(), o_start, slice_len).unwrap();
         if seq_len > 0 {
             expand_sequence(&resolved, seq_len,&mut cur_o_pos, &mut output);
@@ -66,17 +505,17 @@ pub fn deref_non_copy_ss(extracted:Vec<VcdExtract>)->Vec<VcdExtract>{
             for resolved_inst in resolved {
                 let o_pos_start = cur_o_pos;
                 cur_o_pos += resolved_inst.inst.len_in_o() as u64;
-                output.push(DisInst { o_pos_start, inst: resolved_inst.inst });
+                output.push(SparseInst { o_pos_start, inst: resolved_inst.inst });
             }
         }
     }
     output
 }
 
-fn find_copy_s(extract:&[VcdExtract],shift:usize,dest:&mut Vec<usize>){
+fn find_copy_s(extract:&[SparseInst],shift:usize,dest:&mut Vec<usize>){
     for (i,ext) in extract.iter().enumerate(){
-        match ext.inst_type(){
-            InstType::Copy { copy_type:CopyType::CopyS, vcd_trgt:false } => dest.push(i+shift),
+        match (ext.inst_type(),ext.inst.vcd_trgt()){
+            (InstType::Copy (CopyType::CopyS),false) => dest.push(i+shift),
             _ => (),
         }
     }
@@ -86,7 +525,7 @@ fn find_copy_s(extract:&[VcdExtract],shift:usize,dest:&mut Vec<usize>){
 #[derive(Clone, Debug)]
 pub struct Merger{
     ///The summary patch that will be written to the output.
-    terminal_patch: Vec<VcdExtract>,
+    terminal_patch: Vec<SparseInst>,
     ///If this is empty, merging a patch will have no effect.
     ///These are where TerminalInst::CopySS are found.
     terminal_copy_indices: Vec<usize>,
@@ -97,7 +536,7 @@ impl Merger {
     pub fn new<R:Read + Seek>(terminal_patch:R) -> std::io::Result<Result<Merger,SummaryPatch>> {
         let (terminal_patch,stats) = extract_patch_instructions(terminal_patch)?;
         if stats.copy_bytes == 0{
-            return Ok(Err(SummaryPatch(terminal_patch,stats.output_size as u64)));
+            return Ok(Err(SummaryPatch(terminal_patch)));
         }
         let mut terminal_copy_indices = Vec::new();
         //we for sure need to translate local. I think translate global isn't needed??
@@ -105,7 +544,6 @@ impl Merger {
         let terminal_patch = deref_non_copy_ss(terminal_patch);
         find_copy_s(&terminal_patch,0,&mut terminal_copy_indices);
         debug_assert!(!terminal_copy_indices.is_empty(), "terminal_copy_indices should not be empty");
-        //dbg!(&terminal_patch);
         Ok(Ok(Merger{terminal_patch,terminal_copy_indices,final_size:stats.output_size as u64}))
     }
     pub fn merge<R:Read + Seek>(mut self, predecessor_patch:R) -> std::io::Result<Result<Merger,SummaryPatch>> {
@@ -125,10 +563,10 @@ impl Merger {
         let mut inserts = Vec::with_capacity(self.terminal_copy_indices.len());
         let mut shift = 0;
         for i in self.terminal_copy_indices{
-            let DisInst { inst,.. } = self.terminal_patch[i].clone();
+            let SparseInst { inst,.. } = self.terminal_patch[i].clone();
             let copy = inst.take_copy().expect("Expected Copy");
             //this a src window copy that we need to resolve from the predecessor patch.
-            debug_assert!(copy.in_s());
+            debug_assert!(copy.copy_in_s());
             debug_assert!(!copy.vcd_trgt());
             let o_start = copy.ssp + copy.u_pos as u64; //ssp is o_pos, u is offset from that.
             let resolved = get_exact_slice(&predecessor_patch, o_start, copy.len_in_u()).unwrap();
@@ -142,14 +580,14 @@ impl Merger {
         self.terminal_patch = expand_elements(self.terminal_patch, inserts);
         debug_assert_eq!(sum_len(&self.terminal_patch), self.final_size, "final size: {} sum_len: {}",self.final_size,sum_len(&self.terminal_patch));
         if terminal_copy_indices.is_empty(){
-            Ok(Err(SummaryPatch(self.terminal_patch,self.final_size)))
+            Ok(Err(SummaryPatch(self.terminal_patch)))
         }else{
             self.terminal_copy_indices = terminal_copy_indices;
             Ok(Ok(self))
         }
     }
     pub fn finish(self)->SummaryPatch{
-        SummaryPatch(self.terminal_patch,self.final_size)
+        SummaryPatch(self.terminal_patch)
     }
 
 }
@@ -157,42 +595,38 @@ impl Merger {
 ///This is returned when a terminal patch has no CopySS instructions.
 ///Merging additional patches will have no effect.
 #[derive(Debug)]
-pub struct SummaryPatch(Vec<VcdExtract>,u64);
+pub struct SummaryPatch(Vec<SparseInst>);
 impl SummaryPatch{
     pub fn write<W:Write>(self,sink:W,max_u_size:Option<usize>)->std::io::Result<W>{
         let max_u_size = max_u_size.unwrap_or(1<<28); //256MB
         let header = Header::default();
-        let encoder = VCDEncoder::new(sink,header)?;
-        let mut state = EncoderState{
+        let encoder = VCDWriter::new(sink,header)?;
+        let mut state = WriterState{
             cur_o_pos: 0,
             max_u_size,
             cur_win: Vec::new(),
             sink: encoder,
             win_sum: Some(Default::default()),
         };
-        let mut len = 0;
         for inst in self.0.into_iter(){
-            len += inst.inst.len_in_o() as u64;
             state.apply_instruction(inst.inst)?;
         }
-        debug_assert!(len == self.1, "before apply: {} final_size: {}",len,self.1);
-        debug_assert!(state.cur_o_pos == self.1, "cur_o_pos: {} final_size: {}",state.cur_o_pos,self.1);
         state.flush_window()?;
         state.sink.finish()
     }
 }
 
-struct EncoderState<W>{
+struct WriterState<W>{
     cur_o_pos: u64,
     max_u_size: usize,
-    cur_win: Vec<ExInstType<DisCopy>>,
-    win_sum: Option<WindowHeader>,
-    sink: VCDEncoder<W>,
+    cur_win: Vec<DInst>,
+    win_sum: Option<WriteWindowHeader>,
+    sink: VCDWriter<W>,
 }
 
-impl<W:Write> EncoderState<W> {
+impl<W:Write> WriterState<W> {
     ///This is the 'terminal' command for moving the merger forward.
-    fn apply_instruction(&mut self, instruction: ExInstType<DisCopy>) ->std::io::Result<()>{
+    fn apply_instruction(&mut self, instruction: DInst) ->std::io::Result<()>{
         //this needs to do several things:
         //see if we our new instruction is the same win_indicator as our current window
         //see if our sss/ssp values need to be changed,
@@ -252,10 +686,7 @@ impl<W:Write> EncoderState<W> {
         Ok(())
 
     }
-    fn add_to_window(&mut self,next_inst:ExInstType<DisCopy>){
-        //dbg!(&next_inst);
-
-        //debug_assert!(output_start_pos == self.cur_o_pos, "inst output start pos: {} cur_o_pos: {}", output_start_pos, self.cur_o_pos);
+    fn add_to_window(&mut self,next_inst:DInst){
         //adjust our current window
         let (src_range,trgt_win_size) = self.new_win_sizes(&next_inst);
         let ws = self.win_sum.get_or_insert(Default::default());
@@ -270,10 +701,10 @@ impl<W:Write> EncoderState<W> {
         self.cur_o_pos += next_inst.len_in_o() as u64;
         self.cur_win.push(next_inst);
     }
-    fn handle_indicator(&mut self,inst:&ExInstType<DisCopy>)->std::io::Result<()>{
+    fn handle_indicator(&mut self,inst:&DInst)->std::io::Result<()>{
         let win_sum = self.win_sum.get_or_insert(Default::default());
 
-        match (win_sum.win_indicator,inst.inst_type().comp_indicator(&win_sum.win_indicator)){
+        match (win_sum.win_indicator,comp_indicator(&inst.inst_type(),&win_sum.win_indicator,inst.vcd_trgt())){
             (_, None) => (),
             (WinIndicator::Neither, Some(set)) => {
                 win_sum.win_indicator = set;
@@ -281,7 +712,7 @@ impl<W:Write> EncoderState<W> {
             (WinIndicator::VCD_TARGET, Some(next)) |
             (WinIndicator::VCD_SOURCE, Some(next)) => {
                 self.flush_window()?;
-                let mut h = WindowHeader::default();
+                let mut h = WriteWindowHeader::default();
                 h.win_indicator = next;
                 self.win_sum = Some(h);
             },
@@ -289,7 +720,7 @@ impl<W:Write> EncoderState<W> {
         Ok(())
     }
     ///(ssp,sss, size_of_the_target_window (T))
-    fn new_win_sizes(&self,inst:&ExInstType<DisCopy>)->(Option<(u64,u64)>,u64){
+    fn new_win_sizes(&self,inst:&DInst)->(Option<(u64,u64)>,u64){
         let src_range = inst.src_range();
         let ws = self.win_sum.clone().unwrap_or(Default::default());
         let ss = if let Some(r) = src_range{
@@ -317,24 +748,24 @@ impl<W:Write> EncoderState<W> {
         self.sink.start_new_win(ws)?;
         for inst in self.cur_win.drain(..) {
             match inst {
-                ExInstType::Add(ExAdd{bytes}) => {
-                    self.sink.next_inst(EncInst::ADD(bytes)).unwrap();
+                DInst::Add(ExAdd{bytes}) => {
+                    self.sink.next_inst(WriteInst::ADD(bytes)).unwrap();
                 },
-                ExInstType::Run(r) => {
-                    self.sink.next_inst(EncInst::RUN(r)).unwrap();
+                DInst::Run(r) => {
+                    self.sink.next_inst(WriteInst::RUN(r)).unwrap();
                 },
-                ExInstType::Copy(DisCopy { len_u, u_pos , ssp,.. }) => {
+                DInst::Copy(DCopy { len_u, u_pos , ssp,copy_type,.. }) => {
                     //we need to translate this so our u_pos is correct
                     let output_ssp = output_ssp.expect("output_ssp should be set here");
                     //our ssp is within (or coincident) to the bounds of the source segment
                     let copy_inst = if output_ssp > ssp{
                         let neg_shift = output_ssp - ssp;
-                        COPY { len:len_u, u_pos: u_pos - neg_shift as u32 }
+                        COPY { len:len_u, u_pos: u_pos - neg_shift as u32,copy_type }
                     }else{
                         let pos_shift = ssp - output_ssp;
-                        COPY { len:len_u, u_pos: u_pos + pos_shift as u32 }
+                        COPY { len:len_u, u_pos: u_pos + pos_shift as u32,copy_type }
                     };
-                    self.sink.next_inst(EncInst::COPY(copy_inst)).unwrap();
+                    self.sink.next_inst(WriteInst::COPY(copy_inst)).unwrap();
                 },
             }
         }
@@ -348,11 +779,11 @@ impl<W:Write> EncoderState<W> {
     }
 }
 
-fn expand_sequence(seq:&[VcdExtract],len:u32,cur_o_pos:&mut u64,output:&mut Vec<VcdExtract>) {
+fn expand_sequence(seq:&[SparseInst],len:u32,cur_o_pos:&mut u64,output:&mut Vec<SparseInst>) {
     let mut current_len = 0;
     // Calculate the effective length after considering truncation
     while current_len < len {
-        for DisInst {  inst, .. } in seq.iter().cloned() {
+        for SparseInst {  inst, .. } in seq.iter().cloned() {
             let end_pos = current_len + inst.len_in_o();
             let mut modified_instruction = inst;
             // After skip has been accounted for, directly clone and potentially modify for truncation
@@ -362,7 +793,7 @@ fn expand_sequence(seq:&[VcdExtract],len:u32,cur_o_pos:&mut u64,output:&mut Vec<
                 modified_instruction.trunc(trunc_amt);
             }
             let inst_len = modified_instruction.len_in_o();
-            output.push(DisInst { o_pos_start:*cur_o_pos, inst: modified_instruction });
+            output.push(SparseInst { o_pos_start:*cur_o_pos, inst: modified_instruction });
             current_len += inst_len;
             *cur_o_pos += inst_len as u64;
             // If we've reached or exceeded the effective length, break out of the loop
@@ -411,7 +842,7 @@ fn get_disjoint_range<T: Ord + Debug>(range1: Range<T>, range2: Range<T>) -> Opt
         _ => None,
     }
 }
-fn expand_elements(mut target: Vec<VcdExtract>, inserts: Vec<(usize, Vec<VcdExtract>)>) -> Vec<VcdExtract>{
+fn expand_elements(mut target: Vec<SparseInst>, inserts: Vec<(usize, Vec<SparseInst>)>) -> Vec<SparseInst>{
     // Calculate the total number of elements to be inserted to determine the new vector's length.
     let total_insertions: usize = inserts.iter().map(|(_, ins)| ins.len()).sum();
     let final_length = target.len() + total_insertions;
@@ -465,7 +896,10 @@ fn expand_elements(mut target: Vec<VcdExtract>, inserts: Vec<(usize, Vec<VcdExtr
 
 #[cfg(test)]
 mod test_super {
-    use crate::{applicator::apply_patch, reader::DeltaIndicator, RUN};
+
+    use vcdiff_common::DeltaIndicator;
+    use vcdiff_decoder::apply_patch;
+    use vcdiff_writer::WriteWindowHeader;
 
     use super::*;
     /*
@@ -500,7 +934,7 @@ mod test_super {
     We can then mix and match these patches and we should be able to reason about the outputs.
     */
     const HDR:Header = Header { hdr_indicator: 0, secondary_compressor_id: None, code_table_data: None };
-    const WIN_HDR:WindowHeader = WindowHeader {
+    const WIN_HDR:WriteWindowHeader = WriteWindowHeader {
         win_indicator: WinIndicator::VCD_SOURCE,
         source_segment_size: Some(5),
         source_segment_position: Some(0),
@@ -512,49 +946,49 @@ mod test_super {
         Cursor::new(patch_bytes)
     }
     fn seq_patch() -> Cursor<Vec<u8>> {
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 2 })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 10, u_pos: 5 })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 0,copy_type:CopyType::CopyS })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 2, u_pos: 2,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 10, u_pos: 5,copy_type:CopyType::CopyQ { len_o:7 }  })).unwrap();
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
         make_patch_reader(w)
     }
     fn copy_patch() -> Cursor<Vec<u8>> {
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 5, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 5, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
         make_patch_reader(w)
     }
     fn add_run_patch() -> Cursor<Vec<u8>> {
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::ADD("A".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 1 })).unwrap();
-        encoder.next_inst(EncInst::RUN(RUN { len: 3, byte: b'X' })).unwrap();
-        encoder.next_inst(EncInst::ADD("YZ".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 3 })).unwrap();
+        encoder.next_inst(WriteInst::ADD("A".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 2, u_pos: 1,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.next_inst(WriteInst::RUN(RUN { len: 3, byte: b'X' })).unwrap();
+        encoder.next_inst(WriteInst::ADD("YZ".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 2, u_pos: 3,copy_type:CopyType::CopyS  })).unwrap();
 
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
         make_patch_reader(w)
     }
     fn complex_patch()->Cursor<Vec<u8>>{
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
         encoder.start_new_win(WIN_HDR).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::ADD("Y".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::RUN(RUN { len: 2, byte: b'Z' })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 4 })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 2, u_pos: 5 })).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 1 })).unwrap();
+        encoder.next_inst(WriteInst::ADD("Y".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::RUN(RUN { len: 2, byte: b'Z' })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 4,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 2, u_pos: 5,copy_type:CopyType::CopyT { inst_u_pos_start: 9 }  })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 4, u_pos: 1,copy_type:CopyType::CopyS  })).unwrap();
         // Force encoding
         let w = encoder.finish().unwrap().into_inner();
         make_patch_reader(w)
@@ -571,7 +1005,7 @@ mod test_super {
         let merged_patch = merger.finish().write(Vec::new(), None).unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(SRC.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -588,7 +1022,7 @@ mod test_super {
         let merged_patch = merger.finish().write(Vec::new(), None).unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(SRC.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -607,7 +1041,7 @@ mod test_super {
         let merged_patch = merger.finish().write(Vec::new(), None).unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(SRC.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -626,7 +1060,7 @@ mod test_super {
         let merged_patch = merger.finish().write(Vec::new(), None).unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(SRC.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -643,7 +1077,7 @@ mod test_super {
         let merged_patch = merger.finish().write(Vec::new(), None).unwrap();
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(SRC.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(SRC.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -677,45 +1111,45 @@ mod test_super {
         //we need to use a series of VCD_TARGET windows and Sequences across multiple patches
         //we should use copy/seq excessively since add/run is simple in the code paths.
         let src = b"hello!";
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(5), source_segment_position: Some(0), size_of_the_target_window:5 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(5), source_segment_position: Some(0), size_of_the_target_window:5 , delta_indicator: DeltaIndicator(0) }).unwrap();
         // Instructions
-        encoder.next_inst(EncInst::COPY(COPY { len: 5, u_pos: 0 })).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(1), source_segment_position: Some(4), size_of_the_target_window:6 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::ADD(" w".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
-        encoder.next_inst(EncInst::ADD("rld".as_bytes().to_vec())).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(1), source_segment_position: Some(5), size_of_the_target_window:1 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 0 })).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 5, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(1), source_segment_position: Some(4), size_of_the_target_window:6 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::ADD(" w".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
+        encoder.next_inst(WriteInst::ADD("rld".as_bytes().to_vec())).unwrap();
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(1), source_segment_position: Some(5), size_of_the_target_window:1 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap();
         let p1 = encoder.finish().unwrap().into_inner();
         let p1_answer = b"hello world!";
         let mut cursor = Cursor::new(p1.clone());
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(src.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(src.to_vec())), &mut output).unwrap();
         assert_eq!(output,p1_answer); //ensure our instructions do what we think they are.
         let patch_1 = make_patch_reader(p1);
-        let mut encoder = VCDEncoder::new(Cursor::new(Vec::new()), HDR).unwrap();
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(11), source_segment_position: Some(1), size_of_the_target_window:7 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::ADD("H".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 4, u_pos: 0 })).unwrap(); //ello
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 10 })).unwrap(); //'!'
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 4 })).unwrap(); //' '
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(7), source_segment_position: Some(0), size_of_the_target_window:14 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 7, u_pos: 0 })).unwrap(); //'Hello! '
-        encoder.next_inst(EncInst::COPY(COPY { len: 12, u_pos: 7 })).unwrap(); //'Hello! Hello'
-        encoder.next_inst(EncInst::ADD(".".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 1, u_pos: 13 })).unwrap(); // ' '
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(6), source_segment_position: Some(15), size_of_the_target_window:7, delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::ADD("h".as_bytes().to_vec())).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 6, u_pos: 0 })).unwrap(); //'ello. '
-        encoder.start_new_win(WindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(6), source_segment_position: Some(21), size_of_the_target_window:8 , delta_indicator: DeltaIndicator(0) }).unwrap();
-        encoder.next_inst(EncInst::COPY(COPY { len: 6, u_pos: 0 })).unwrap(); //'hello.'
-        encoder.next_inst(EncInst::COPY(COPY { len: 3, u_pos: 11 })).unwrap(); //Seq '.' == Run(3) '.'
+        let mut encoder = VCDWriter::new(Cursor::new(Vec::new()), HDR).unwrap();
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_SOURCE, source_segment_size: Some(11), source_segment_position: Some(1), size_of_the_target_window:7 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::ADD("H".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 4, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //ello
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 10,copy_type:CopyType::CopyS  })).unwrap(); //'!'
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 4,copy_type:CopyType::CopyS  })).unwrap(); //' '
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(7), source_segment_position: Some(0), size_of_the_target_window:14 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 7, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //'Hello! '
+        encoder.next_inst(WriteInst::COPY(COPY { len: 12, u_pos: 7,copy_type:CopyType::CopyQ { len_o: 5 }  })).unwrap(); //'Hello! Hello'
+        encoder.next_inst(WriteInst::ADD(".".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 1, u_pos: 13,copy_type:CopyType::CopyS  })).unwrap(); // ' '
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(6), source_segment_position: Some(15), size_of_the_target_window:7, delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::ADD("h".as_bytes().to_vec())).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 6, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //'ello. '
+        encoder.start_new_win(WriteWindowHeader { win_indicator: WinIndicator::VCD_TARGET, source_segment_size: Some(6), source_segment_position: Some(21), size_of_the_target_window:8 , delta_indicator: DeltaIndicator(0) }).unwrap();
+        encoder.next_inst(WriteInst::COPY(COPY { len: 6, u_pos: 0,copy_type:CopyType::CopyS  })).unwrap(); //'hello.'
+        encoder.next_inst(WriteInst::COPY(COPY { len: 3, u_pos: 11,copy_type:CopyType::CopyQ { len_o: 2 }  })).unwrap(); //Seq '.' == Run(3) '.'
         let p2 = encoder.finish().unwrap().into_inner();
         let p2_answer = b"Hello! Hello! Hello. hello. hello...";
         let mut cursor = Cursor::new(p2.clone());
         let mut output = Vec::new();
-        apply_patch(&mut cursor, Some(Cursor::new(p1_answer.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(p1_answer.to_vec())), &mut output).unwrap();
         assert_eq!(output,p2_answer);
         let patch_2 = make_patch_reader(p2);
         let merger = Merger::new(patch_2).unwrap().unwrap();
@@ -724,7 +1158,7 @@ mod test_super {
         let mut cursor = Cursor::new(merged_patch);
         let mut output = Vec::new();
         let answer = b"Hello! Hello! Hello. hello. hello...";
-        apply_patch(&mut cursor, Some(Cursor::new(src.to_vec())), &mut output).unwrap();
+        apply_patch(&mut cursor, Some(&mut Cursor::new(src.to_vec())), &mut output).unwrap();
         //print output as a string
         let as_str = std::str::from_utf8(&output).unwrap();
         println!("{}",as_str);
@@ -793,18 +1227,18 @@ mod test_super {
     #[test]
     fn test_expand_seq(){
         let seq = vec![
-            VcdExtract { o_pos_start: 0, inst: ExInstType::Copy(DisCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 2, inst: ExInstType::Copy(DisCopy { u_pos: 4, len_u: 6, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 8, inst: ExInstType::Copy(DisCopy { u_pos: 12, len_u: 4, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 0, inst: DInst::Copy(DCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 2, inst: DInst::Copy(DCopy { u_pos: 4, len_u: 6, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 8, inst: DInst::Copy(DCopy { u_pos: 12, len_u: 4, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
         ];
         let mut output = Vec::new();
         expand_sequence(&seq, 15, &mut 0,&mut output);
         let result = vec![
-            VcdExtract { o_pos_start: 0, inst: ExInstType::Copy(DisCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 2, inst: ExInstType::Copy(DisCopy { u_pos: 4, len_u: 6, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 8, inst: ExInstType::Copy(DisCopy { u_pos: 12, len_u: 4, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 12, inst: ExInstType::Copy(DisCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
-            VcdExtract { o_pos_start: 14, inst: ExInstType::Copy(DisCopy { u_pos: 4, len_u: 1, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 0, inst: DInst::Copy(DCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 2, inst: DInst::Copy(DCopy { u_pos: 4, len_u: 6, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 8, inst: DInst::Copy(DCopy { u_pos: 12, len_u: 4, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 12, inst: DInst::Copy(DCopy { u_pos: 0, len_u: 2, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
+            SparseInst { o_pos_start: 14, inst: DInst::Copy(DCopy { u_pos: 4, len_u: 1, sss: 0, ssp: 0, vcd_trgt: false, copy_type: CopyType::CopyS }) },
         ];
         assert_eq!(output, result, "Output should contain a truncated instruction");
     }
