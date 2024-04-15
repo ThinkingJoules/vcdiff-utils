@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-writer"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 description = "A library for creating valid VCDIFF files (not an encoder)."
 license = "MIT"
 version = "1.0.0"

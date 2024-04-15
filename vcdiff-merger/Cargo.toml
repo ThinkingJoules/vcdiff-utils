@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-merger"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 description = "A pure Rust library for merging VCDIFF files."
 license = "MIT"
 version = "1.0.0"

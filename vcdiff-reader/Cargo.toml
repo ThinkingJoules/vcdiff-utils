@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-reader"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 description = "A library for reading VCDIFF files"
 license = "MIT"
 version = "1.0.0"

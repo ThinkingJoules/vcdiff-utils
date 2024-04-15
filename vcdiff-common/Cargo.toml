@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-common"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 description = "Common structs, functions, and traits for vcdiff format"
 license = "MIT"
 version = "1.0.0"

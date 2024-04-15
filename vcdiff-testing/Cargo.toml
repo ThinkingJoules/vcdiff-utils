@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-testing"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 version = "0.1.0"
 edition = "2021"
 

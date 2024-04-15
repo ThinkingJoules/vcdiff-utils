@@ -1,5 +1,6 @@
 [package]
 name = "vcdiff-decoder"
+repository = "https://github.com/ThinkingJoules/vcdiff-utils"
 description = "A pure Rust implementation for a VCDIFF decoder."
 license = "MIT"
 version = "1.0.0"
