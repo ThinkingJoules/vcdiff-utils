@@ -9,4 +9,4 @@ keywords = ["vcdiff", "delta", "patch", "delta encoding", "delta compression"]
 categories = ["compression","encoding","decoding"]
 
 [dependencies]
-vcdiff-common ={ path = "../vcdiff-common"}
+vcdiff-common ={ version = "1", path = "../vcdiff-common"}
