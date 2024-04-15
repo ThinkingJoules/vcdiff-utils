@@ -5,7 +5,7 @@ description = "A pure Rust library for merging VCDIFF files."
 license = "MIT"
 version = "1.0.0"
 edition = "2021"
-keywords = ["vcdiff", "delta", "patch", "delta encoding", "delta compression"]
+keywords = ["vcdiff", "delta", "patch", "delta-encoding", "delta-compression"]
 categories = ["compression","encoding","decoding"]
 
 [dependencies]

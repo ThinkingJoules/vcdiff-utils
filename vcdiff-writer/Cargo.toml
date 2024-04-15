@@ -5,7 +5,7 @@ description = "A library for creating valid VCDIFF files (not an encoder)."
 license = "MIT"
 version = "1.0.0"
 edition = "2021"
-keywords = ["vcdiff", "delta", "patch", "delta encoding", "delta compression"]
+keywords = ["vcdiff", "delta", "patch", "delta-encoding", "delta-compression"]
 categories = ["compression","encoding","decoding"]
 
 [dependencies]
