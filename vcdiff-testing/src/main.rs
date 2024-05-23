@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{copy, Cursor, Read, Write};
 use std::path::Path;
 use reqwest::blocking::Client;
+use vcdiff_merger::Stats;
 use xdelta3::stream::Xd3Config;
 use std::time::Instant;
 use open_vcdiff_rs_bindings::{FORMAT_STANDARD,encode};
@@ -14,23 +16,24 @@ fn main() {
     test_baseline_xdelta().unwrap();
     let res = test_baseline_ovcd_encode_xdelta_decode();
     if res.is_err() {
-        println!("Error: {:?}", res.err().unwrap());
+        println!("test_baseline_ovcd_encode_xdelta_decode Error: {:?}", res.err().unwrap());
     }
     let res = test_baseline_xdelta_encode_vcdiff_decode();
     if res.is_err() {
-        println!("Error: {:?}", res.err().unwrap());
+        println!("test_baseline_xdelta_encode_vcdiff_decode Error: {:?}", res.err().unwrap());
     }
     let res = test_baseline_ovcd_encode_vcdiff_decode();
     if res.is_err() {
-        println!("Error: {:?}", res.err().unwrap());
+        println!("test_baseline_ovcd_encode_vcdiff_decode Error: {:?}", res.err().unwrap());
     }
     let res = test_merge();
     if res.is_err() {
-        println!("Error: {:?}", res.err().unwrap());
+        println!("test_merge Error: {:?}", res.err().unwrap());
     }
+    //gcc2951_2952_openvcdiff_analysis().unwrap();
 
 }
-const DIR_PATH: &str = "../target/downloads";
+const DIR_PATH: &str = "./target/downloads";
 fn test_baseline_xdelta() -> Result<(), Box<dyn std::error::Error>> {
     prepare_test(DIR_PATH)?;
     let (_,patch) = open_and_hash_file(&Path::new(DIR_PATH).join("patch_a.xdelta3.vcdiff")).unwrap();
@@ -314,5 +317,90 @@ fn prepare_test(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+use vcdiff_common::{CopyType, Inst, Instruction, ADD};
+
+pub fn gcc2951_2952_openvcdiff_analysis()-> Result<(), Box<dyn std::error::Error>> {
+    let mut file = fs::File::open(&Path::new(DIR_PATH).join("patch.vcdiff"))?;
+    let mut patch_a = Vec::new();
+    file.read_to_end(&mut patch_a)?;
+    let reader = Cursor::new(patch_a);
+    let mut reader = vcdiff_reader::VCDReader::new(reader).unwrap();
+    let mut s_copy_lens = HashMap::new();
+    let mut t_copy_lens = HashMap::new();
+    let mut q_copy_lens = HashMap::new();
+    let mut stats = Stats::new();
+    loop {
+        let m = reader.next().unwrap();
+        match m {
+            vcdiff_reader::VCDiffReadMsg::WindowSummary(a) => {
+                println!("Window Summary: {:?}", a);
+            },
+            vcdiff_reader::VCDiffReadMsg::Inst { first, second } => {
+                for inst in [Some(first), second]{
+                    if inst.is_none(){
+                        continue;
+                    }
+                    let inst = inst.unwrap();
+                    let len_o = inst.len_in_o() as usize;
+                    match inst{
+                        Inst::Add(ADD{ .. }) => {
+                            stats.add(len_o);
+                        },
+                        Inst::Run(_) => {
+                            stats.run(len_o);
+                        },
+                        Inst::Copy(copy) =>{
+                            match copy.copy_type{
+                                CopyType::CopyQ{..} => {
+                                    q_copy_lens.entry(len_o).and_modify(|e| *e += 1).or_insert(1);
+                                    stats.copy_q(len_o);
+                                },
+                                CopyType::CopyS => {
+                                    s_copy_lens.entry(len_o).and_modify(|e| *e += 1).or_insert(1);
+                                    stats.copy_s(len_o);
+                                },
+                                CopyType::CopyT{..} => {
+                                    t_copy_lens.entry(len_o).and_modify(|e| *e += 1).or_insert(1);
+                                    stats.copy_t(len_o);
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+            vcdiff_reader::VCDiffReadMsg::EndOfWindow => {
+                println!("{:?}", stats);
+                //collect the s_copy_lens and sort ascending by key, then print out all the keys and values
+                let mut s_copies: Vec<_> = s_copy_lens.into_iter().collect();
+                s_copies.sort_by_key(|k| k.0);
+                println!("S Copy Lens:");
+                for (k,v) in s_copies {
+                    println!("{}: {}", k, v);
+                }
+                s_copy_lens = HashMap::new();
+                let mut t_copies: Vec<_> = t_copy_lens.into_iter().collect();
+                t_copies.sort_by_key(|k| k.0);
+                println!("T Copy Lens:");
+                for (k,v) in t_copies {
+                    println!("{}: {}", k, v);
+                }
+                t_copy_lens = HashMap::new();
+                let mut q_copies: Vec<_> = q_copy_lens.into_iter().collect();
+                q_copies.sort_by_key(|k| k.0);
+                println!("Q Copy Lens:");
+                for (k,v) in q_copies {
+                    println!("{}: {}", k, v);
+                }
+                q_copy_lens = HashMap::new();
+                //pause for 10 sec
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            },
+            vcdiff_reader::VCDiffReadMsg::EndOfFile => {
+                break;
+            },
+        }
+    }
 
 
+    Ok(())
+}
